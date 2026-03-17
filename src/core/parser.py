@@ -65,7 +65,7 @@ def build_pdf_converter() -> DocumentConverter:
         do_ocr=True,
         ocr_model="suryaocr",
         allow_external_plugins=True,
-        ocr_options=SuryaOcrOptions(lang=["en", "id"], force_full_page_ocr=True),
+        ocr_options=SuryaOcrOptions(lang=["en", "id"], force_full_page_ocr=False),
         accelerator_options=AcceleratorOptions(
             device=AcceleratorDevice.CUDA,
             num_threads=8,
@@ -111,7 +111,7 @@ def build_image_converter() -> DocumentConverter:
         do_ocr=True,
         ocr_model="suryaocr",
         allow_external_plugins=True,
-        ocr_options=SuryaOcrOptions(lang=["en", "id"], force_full_page_ocr=True),
+        ocr_options=SuryaOcrOptions(lang=["en", "id"], force_full_page_ocr=False),
         accelerator_options=AcceleratorOptions(
             device=AcceleratorDevice.CUDA,
             num_threads=8,

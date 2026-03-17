@@ -88,9 +88,9 @@ async def parse_pdf_endpoint(
     _validate_page_range(_start, _end)
     file_bytes = await _read_file(file)
 
-    from src.modal_app import parse_pdf
+    from src.modal_app import DocumentParser
 
-    call = await parse_pdf.spawn.aio(
+    call = await DocumentParser().parse_pdf.spawn.aio(
         file_bytes,
         file.filename,
         company,
@@ -139,9 +139,9 @@ async def parse_image_endpoint(
     _validate_ext(file.filename, IMAGE_EXTS)
     file_bytes = await _read_file(file)
 
-    from src.modal_app import parse_image
+    from src.modal_app import DocumentParser
 
-    call = await parse_image.spawn.aio(
+    call = await DocumentParser().parse_image.spawn.aio(
         file_bytes,
         file.filename,
         company,

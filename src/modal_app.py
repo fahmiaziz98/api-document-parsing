@@ -10,6 +10,7 @@ app = modal.App("annual-report-parser")
 
 results_volume = modal.Volume.from_name("parser-results", create_if_missing=True)
 model_volume = modal.Volume.from_name("docling-models", create_if_missing=True)
+VOLUME_MOUNT = "/results"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -28,222 +29,227 @@ image = (
         "numpy",
         "pymupdf",
     )
+    #    .env({
+    #        "HF_HOME":            "/root/model-cache/huggingface",
+    #        "DOCLING_CACHE_DIR":  "/root/model-cache/docling-models",
+    #        "TORCH_HOME":         "/root/model-cache/torch",
+    #    })
     .add_local_dir("src", remote_path="/root/src")
 )
 
-GPU_CONFIG = "A10G"
 
-
-@app.function(
+@app.cls(
     image=image,
-    gpu=GPU_CONFIG,
+    gpu="A10G",
     timeout=1800,
     secrets=[modal.Secret.from_name("parser-secret")],
     volumes={
         "/results": results_volume,
-        "/root/.cache": model_volume,
+        "/root/model-cache": model_volume,
     },
-)
-def parse_pdf(
-    file_bytes: bytes,
-    filename: str,
-    company: str,
-    year: int,
-    start_page: int | None = None,
-    end_page: int | None = None,
-    enable_rotate: bool = False,
-    enable_crop: bool = False,
-) -> dict:
-    """
-    Modal function to parse a PDF file, performing layout analysis, OCR, and table extraction.
-
-    Args:
-        file_bytes (bytes): File bytes
-        filename (str): File name
-        company (str): Company name
-        year (int): Year
-        start_page (int | None): Start page
-        end_page (int | None): End page
-        enable_rotate (bool): Enable rotation
-        enable_crop (bool): Enable crop
-
-    Returns:
-        dict: Job result
-
-    Raises:
-        Exception: If the job fails
-    """
-    from src.core.exporter import export_raw_elements
-    from src.core.parser import build_pdf_converter
-    from src.core.preprocess import preprocess_pdf
-    from src.models.response import JobStatusEnum
-    from src.utils.logging import setup_logging
-
-    try:
-        setup_logging()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            input_path = Path(tmp) / filename
-            input_path.write_bytes(file_bytes)
-
-            if enable_rotate or enable_crop:
-                processed_path = Path(tmp) / f"processed_{filename}"
-                input_path = preprocess_pdf(
-                    input_path=input_path,
-                    output_path=processed_path,
-                    start_page=start_page,
-                    end_page=end_page,
-                    enable_rotate=enable_rotate,
-                    enable_crop=enable_crop,
-                    dpi=200,
-                )
-
-            converter = build_pdf_converter()
-
-            if start_page or end_page:
-                pdf_doc = fitz.open(str(input_path))
-                total_pages = len(pdf_doc)
-                pdf_doc.close()
-
-                resolved_start = start_page or 1
-                resolved_end = end_page or total_pages
-
-                resolved_start = max(1, resolved_start)
-                resolved_end = min(total_pages, resolved_end)
-
-                page_range = (resolved_start, resolved_end)
-                logger.info(f"Docling page range: {page_range} / {total_pages} pages")
-            else:
-                page_range = None
-                logger.info("Docling page range: full document")
-
-            convert_kwargs = dict(source=str(input_path), raises_on_error=False)
-            if page_range is not None:
-                convert_kwargs["page_range"] = page_range
-
-            result = converter.convert(**convert_kwargs)
-
-            doc = result.document
-
-            logger.info(
-                f"PDF parsed: texts={len(doc.texts)} "
-                f"tables={len(doc.tables)} "
-                f"pictures={len(doc.pictures)}"
-            )
-
-            elements = export_raw_elements(doc, company, year, filename)
-            output_filename = _save_jsonl(elements, company, year, filename)
-
-            return {
-                "status": JobStatusEnum.DONE,
-                "element_count": len(elements),
-                "output_path": output_filename,
-                "elements": elements,
-            }
-    except Exception as e:
-        logger.error("parse_pdf failed catastrophically", exc_info=True)
-        return {"status": JobStatusEnum.ERROR, "error": str(e)}
-
-
-@app.function(
-    image=image,
-    gpu=GPU_CONFIG,
-    timeout=600,
-    secrets=[modal.Secret.from_name("parser-secret")],
-    volumes={
-        "/results": results_volume,
-        "/root/.cache": model_volume,
+    env={
+        # Model cache paths
+        "HF_HOME": "/root/model-cache/huggingface",
+        "DOCLING_CACHE_DIR": "/root/model-cache/docling-models",
+        "TORCH_HOME": "/root/model-cache/torch",
+        "DETECTOR_BATCH_SIZE": "36",
+        "RECOGNITION_BATCH_SIZE": "512",
+        "ORDER_BATCH_SIZE": "32",
     },
+    scaledown_window=15 * 60,  # 15 minutes
 )
-def parse_image(
-    file_bytes: bytes,
-    filename: str,
-    company: str,
-    year: int,
-    enable_rotate: bool = False,
-    enable_crop: bool = False,
-) -> dict:
+@modal.concurrent(max_inputs=5, target_inputs=2)
+class DocumentParser:
     """
-    Modal function to parse a single image using Docling's visual extraction logic.
-
-    Args:
-        file_bytes (bytes): File bytes
-        filename (str): File name
-        company (str): Company name
-        year (int): Year
-        enable_rotate (bool): Enable rotation
-        enable_crop (bool): Enable crop
-
-    Returns:
-        dict: Job result
-
-    Raises:
-        Exception: If the job fails
+    Single class for PDF and image parsing.
     """
-    from src.core.exporter import export_raw_elements
-    from src.core.parser import build_image_converter
-    from src.core.preprocess import preprocess_image
-    from src.models.response import JobStatusEnum
-    from src.utils.logging import setup_logging
 
-    try:
+    @modal.enter()
+    def load(self):
+        from src.core.parser import build_image_converter, build_pdf_converter
+        from src.utils.logging import setup_logging
+
         setup_logging()
+        logger.info("DocumentParser container starting — loading models...")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            input_path = Path(tmp) / filename
-            input_path.write_bytes(file_bytes)
+        self.pdf_converter = build_pdf_converter()
+        self.image_converter = build_image_converter()
 
-            if enable_rotate or enable_crop:
-                processed_path = Path(tmp) / f"processed_{filename}"
-                _, rotation_result = preprocess_image(
-                    image_path=input_path,
-                    enable_rotate=enable_rotate,
-                    enable_crop=enable_crop,
-                    output_path=processed_path,
-                )
-                input_path = processed_path
-                if rotation_result:
-                    logger.info(
-                        f"Rotation applied: {rotation_result.angle.name} "
-                        f"confidence={rotation_result.confidence:.2f}"
+        logger.info("DocumentParser models loaded and ready")
+
+    @modal.method()
+    def parse_pdf(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        company: str,
+        year: int,
+        start_page: int | None = None,
+        end_page: int | None = None,
+        enable_rotate: bool = False,
+        enable_crop: bool = False,
+    ) -> dict:
+        """
+        Parse a PDF file containing a corporate annual report.
+
+        Args:
+            file_bytes: Bytes of the PDF file
+            filename: Filename
+            company: Company name
+            year: Year
+            start_page: Start page
+            end_page: End page
+            enable_rotate: Enable auto-rotation
+            enable_crop: Enable content cropping
+
+        Returns:
+            dict: Job status and results
+        """
+        from src.core.exporter import export_raw_elements
+        from src.core.preprocess import preprocess_pdf
+        from src.models.response import JobStatusEnum
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                input_path = Path(tmp) / filename
+                input_path.write_bytes(file_bytes)
+
+                if enable_rotate or enable_crop:
+                    processed_path = Path(tmp) / f"processed_{filename}"
+                    input_path = preprocess_pdf(
+                        input_path=input_path,
+                        output_path=processed_path,
+                        start_page=start_page,
+                        end_page=end_page,
+                        enable_rotate=enable_rotate,
+                        enable_crop=enable_crop,
+                        dpi=72,
                     )
 
-            converter = build_image_converter()
-            result = converter.convert(str(input_path), raises_on_error=False)
-            doc = result.document
+                if start_page or end_page:
+                    pdf_doc = fitz.open(str(input_path))
+                    total_pages = len(pdf_doc)
+                    pdf_doc.close()
 
-            logger.info(
-                f"Image parsed: texts={len(doc.texts)} "
-                f"tables={len(doc.tables)} "
-                f"pictures={len(doc.pictures)}"
-            )
+                    resolved_start = max(1, start_page or 1)
+                    resolved_end = min(total_pages, end_page or total_pages)
+                    page_range = (resolved_start, resolved_end)
+                    logger.info(f"Page range: {page_range} / {total_pages}")
+                else:
+                    page_range = None
+                    logger.info("Page range: full document")
 
-            elements = export_raw_elements(doc, company, year, filename)
-            output_filename = _save_jsonl(elements, company, year, filename)
+                convert_kwargs = dict(source=str(input_path), raises_on_error=False)
+                if page_range is not None:
+                    convert_kwargs["page_range"] = page_range
 
-            return {
-                "status": JobStatusEnum.DONE,
-                "element_count": len(elements),
-                "output_path": output_filename,
-                "elements": elements,
-            }
-    except Exception as e:
-        logger.error("parse_image failed catastrophically", exc_info=True)
-        return {"status": JobStatusEnum.ERROR, "error": str(e)}
+                result = self.pdf_converter.convert(**convert_kwargs)
+                doc = result.document
+
+                logger.info(
+                    f"PDF parsed: texts={len(doc.texts)} "
+                    f"tables={len(doc.tables)} "
+                    f"pictures={len(doc.pictures)}"
+                )
+
+                elements = export_raw_elements(doc, company, year, filename)
+                output_filename = _save_jsonl(elements, company, year, filename)
+
+                return {
+                    "status": JobStatusEnum.DONE,
+                    "element_count": len(elements),
+                    "output_path": output_filename,
+                    "elements": elements,
+                }
+
+        except Exception as e:
+            logger.error("parse_pdf failed", exc_info=True)
+            return {"status": JobStatusEnum.ERROR, "error": str(e)}
+
+    @modal.method()
+    def parse_image(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        company: str,
+        year: int,
+        enable_rotate: bool = False,
+        enable_crop: bool = False,
+    ) -> dict:
+        """
+        Parse an image file containing a corporate annual report.
+
+        Args:
+            file_bytes: Bytes of the image file
+            filename: Filename
+            company: Company name
+            year: Year
+            enable_rotate: Enable auto-rotation
+            enable_crop: Enable content cropping
+
+        Returns:
+            dict: Job status and results
+        """
+        from src.core.exporter import export_raw_elements
+        from src.core.preprocess import preprocess_image
+        from src.models.response import JobStatusEnum
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                input_path = Path(tmp) / filename
+                input_path.write_bytes(file_bytes)
+
+                if enable_rotate or enable_crop:
+                    processed_path = Path(tmp) / f"processed_{filename}"
+                    _, rotation_result = preprocess_image(
+                        image_path=input_path,
+                        enable_rotate=enable_rotate,
+                        enable_crop=enable_crop,
+                        output_path=processed_path,
+                    )
+                    input_path = processed_path
+                    if rotation_result:
+                        logger.info(
+                            f"Rotation: {rotation_result.angle.name} "
+                            f"confidence={rotation_result.confidence:.2f}"
+                        )
+
+                result = self.image_converter.convert(str(input_path), raises_on_error=False)
+                doc = result.document
+
+                logger.info(
+                    f"Image parsed: texts={len(doc.texts)} "
+                    f"tables={len(doc.tables)} "
+                    f"pictures={len(doc.pictures)}"
+                )
+
+                elements = export_raw_elements(doc, company, year, filename)
+                output_filename = _save_jsonl(elements, company, year, filename)
+
+                return {
+                    "status": JobStatusEnum.DONE,
+                    "element_count": len(elements),
+                    "output_path": output_filename,
+                    "elements": elements,
+                }
+
+        except Exception as e:
+            logger.error("parse_image failed", exc_info=True)
+            return {"status": JobStatusEnum.ERROR, "error": str(e)}
 
 
 def _save_jsonl(elements: list[dict], company: str, year: int, filename: str) -> str:
     """
-    Save elements to a JSONL file
+    Save elements to a JSONL file.
 
     Args:
-        elements (list[dict]): List of elements
-        company (str): Company name
-        year (int): Year
-        filename (str): File name
+        elements: List of elements to save
+        company: Company name
+        year: Year
+        filename: Filename
 
     Returns:
-        str: Output file name
+        Output filename
     """
     output_filename = f"{company}_{year}_{Path(filename).stem}.jsonl"
     output_path = Path(VOLUME_MOUNT) / output_filename

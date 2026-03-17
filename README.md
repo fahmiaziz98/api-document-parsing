@@ -75,7 +75,7 @@ Client
 ## Repository Structure
 
 ```
-annual-report-parser/
+api-document-parsing/
 |
 |-- src/
 |   |-- __init__.py
@@ -170,6 +170,12 @@ Follow the browser prompt to link your Modal account.
 
 ## Configuration
 
+### Generate API Key
+
+```bash
+uv run generated_secret.py
+```
+
 ### Environment Variables
 
 Copy the example file:
@@ -180,7 +186,7 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `API_KEY` | Yes | Master API key for all endpoints (prefix with `sk-`) |
+| `API_KEY` | Yes | Master API key for all endpoints |
 | `GROQ_API_KEY` | Yes | Groq API key for figure description |
 | `GROQ_BASE_URL` | Yes | `https://api.groq.com/openai/v1` |
 | `GROQ_MODEL_ID` | No | Default: `llama-3.3-70b-versatile` |

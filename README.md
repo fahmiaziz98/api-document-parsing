@@ -579,22 +579,7 @@ Look for the traceback associated with the `fc-` function call ID.
 
 ---
 
-### ImportError: cannot import name ConversionLimits
-
-`ConversionLimits` does not exist in current versions of Docling. Use the `page_range` parameter directly on `converter.convert()` as a tuple of integers.
-
----
-
 ## Performance Notes
-
-### Typical processing times on A10G (24GB VRAM)
-
-| Document type | Pages | Time |
-|---|---|---|
-| Native PDF (text layer) | 20 | 30 to 60 seconds |
-| Scanned PDF (full OCR) | 20 | 3 to 6 minutes |
-| Image (JPG/PNG) | 1 | 15 to 30 seconds |
-| Native PDF with tables | 50 | 2 to 4 minutes |
 
 ### Reducing cold start time
 

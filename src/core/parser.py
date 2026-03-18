@@ -32,23 +32,23 @@ OCR_BATCH = 64
 
 
 def _picture_description_options() -> PictureDescriptionApiOptions | None:
-    """Configure Picture Description options using Groq API, gracefully failing if keys are missing."""
-    groq_url = os.getenv("BASE_URL")
-    groq_key = os.getenv("API_KEY")
+    """Configure Picture Description options using Openai Compatible API, gracefully failing if keys are missing."""
+    base_url = os.getenv("OPENAI_BASE_URL")
+    api_key = os.getenv("OPENAI_API_KEY")
 
-    if not groq_url or not groq_key:
+    if not base_url or not api_key:
         logger.warning(
-            "BASE_URL or API_KEY not set. Picture description will be disabled."
+            "OPENAI_BASE_URL or OPENAI_API_KEY not set. Picture description will be disabled."
         )
         return None
 
-    groq_model = os.getenv("MODEL_ID", "llama-3.3-70b-versatile")
+    model = os.getenv("OPENAI_MODEL_ID")
 
     return PictureDescriptionApiOptions(
-        url=f"{groq_url}/chat/completions",
-        params=dict(model=groq_model, seed=42, max_completion_tokens=512),
+        url=f"{base_url}/chat/completions",
+        params=dict(model=model, seed=42, max_completion_tokens=512),
         headers={
-            "Authorization": f"Bearer {groq_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         prompt=PICTURE_DESCRIPTION_PROMPT,

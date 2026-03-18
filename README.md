@@ -192,10 +192,10 @@ cp .env.example .env
 
 | Variable | Required | Description |
 |---|---|---|
-| `API_KEY` | Yes | Master API key for all endpoints |
-| `BASE_URL` | Yes | LLM API base URL for figure description, e.g. `https://api.groq.com/openai/v1` |
-| `API_KEY` | Yes | LLM API key |
-| `MODEL_ID` | No | LLM model ID. Default: `llama-3.3-70b-versatile` |
+| `X_API_KEY` | Yes | Master API key for all endpoints |
+| `OPENAI_BASE_URL` | Yes | LLM API base URL for figure description, e.g. `https://api.groq.com/openai/v1` |
+| `OPENAI_API_KEY` | Yes | LLM API key |
+| `OPENAI_MODEL_ID` | Yes | Vision LM model ID. |
 
 ### Modal Secret
 
@@ -203,17 +203,20 @@ All environment variables must be stored as a Modal Secret named `parser-secret`
 
 ```bash
 uv run modal secret create parser-secret \
-  API_KEY=sk-your-key-here \
-  BASE_URL=https://api.groq.com/openai/v1 \
-  MODEL_ID=llama-3.3-70b-versatile
+  X_API_KEY=sk-your-key-here \
+  OPENAI_BASE_URL=https://api.groq.com/openai/v1 \
+  OPENAI_API_KEY=sk-your-key-here \
+  OPENAI_MODEL_ID=meta-llama/llama-4-scout-17b-16e-instruct
 ```
 
 To update an existing secret:
 
 ```bash
 uv run modal secret create parser-secret --force \
-  API_KEY=sk-new-key \
-  BASE_URL=https://api.groq.com/openai/v1
+  X_API_KEY=sk-new-key \
+  OPENAI_BASE_URL=https://api.groq.com/openai/v1 \
+  OPENAI_API_KEY=sk-new-key \
+  OPENAI_MODEL_ID=meta-llama/llama-4-scout-17b-16e-instruct
 ```
 
 ---

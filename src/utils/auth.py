@@ -20,7 +20,7 @@ async def verify_api_key(api_key: str = Security(API_KEY_HEADER)) -> str:
     Raises:
         HTTPException: If API key is invalid or not configured on the server
     """
-    expected = os.environ.get("API_KEY", "")
+    expected = os.environ.get("X_API_KEY", "")
     if not expected:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

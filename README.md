@@ -1,6 +1,6 @@
-# Annual Report Parser
+# API Document Parsing
 
-A production-grade REST API for parsing bilingual (Indonesian/English) corporate annual reports from PDF and image formats. Built on Docling, deployed on Modal.com with GPU acceleration.
+A production-grade REST API for parsing bilingual (Indonesian/English) documents from PDF and image formats. Built on Docling, deployed on Modal.com with GPU acceleration.
 
 ---
 
@@ -23,17 +23,20 @@ A production-grade REST API for parsing bilingual (Indonesian/English) corporate
 
 ## Overview
 
-This service accepts PDF or image files containing corporate annual reports and returns structured JSON elements including text, tables (as Markdown), and figure descriptions. Each element carries full provenance metadata (page number, bounding box, section, company, year).
+This service accepts PDF or image files containing documents and returns structured JSON elements including text, tables (as Markdown), and figure descriptions. Each element carries a deterministic SHA-256 `id` and full provenance metadata (page number, bounding box, and any user-supplied key-value fields).
 
 Key capabilities:
 
 - Bilingual OCR (Indonesian and English) via SuryaOCR
 - Accurate table extraction with TableFormer
-- Figure/chart description via LLM (Groq)
+- Figure/chart description via LLM (configurable via `BASE_URL` / `MODEL_ID`)
 - Optional per-page auto-rotation and whitespace cropping before parsing
 - Page range filtering to parse only specific sections of a document
 - Asynchronous job processing with polling — suitable for large documents
 - Full-page content aggregation per page number
+- **Dynamic metadata**: pass any key-value pairs (e.g. `company`, `year`, `label`, `type`) at submission time
+- **JSONL download**: fetch the output file directly via `GET /download/{job_id}`
+- Deterministic element `id` (SHA-256) for deduplication and traceability
 
 ---
 
@@ -46,7 +49,7 @@ Client
   |
   FastAPI (Modal web endpoint — CPU container)
   |-- Auth: X-API-Key header validation
-  |-- Input validation: file type, page range
+  |-- Input validation: file type, metadata JSON, page range
   |
   Function.spawn() --> GPU Container (A10G)
                          |
@@ -58,16 +61,19 @@ Client
                          |     SuryaOCR (id + en)
                          |     TableFormer ACCURATE
                          |     docling-layout-heron
-                         |     PictureDescriptionApiOptions -> Groq LLM
+                         |     PictureDescriptionApiOptions -> LLM
                          |
                          |-- export_raw_elements()
-                         |     Per-element: text, table, figure
+                         |     Per-element: SHA-256 id, text, table, figure
+                         |     Per-element: user metadata merged in
                          |     Per-page: full_content aggregation
                          |
                          --> JSONL saved to Modal Volume
+                              ({filename}_{YYYYMMDD_HHMMSS}.jsonl)
   |
   GET /status/{job_id}   --> Poll until done
-  GET /result/{job_id}   --> Retrieve full element list
+  GET /result/{job_id}   --> Retrieve full element list (JSON)
+  GET /download/{job_id} --> Download JSONL file
 ```
 
 ---
@@ -187,9 +193,9 @@ cp .env.example .env
 | Variable | Required | Description |
 |---|---|---|
 | `API_KEY` | Yes | Master API key for all endpoints |
-| `GROQ_API_KEY` | Yes | Groq API key for figure description |
-| `GROQ_BASE_URL` | Yes | `https://api.groq.com/openai/v1` |
-| `GROQ_MODEL_ID` | No | Default: `llama-3.3-70b-versatile` |
+| `BASE_URL` | Yes | LLM API base URL for figure description, e.g. `https://api.groq.com/openai/v1` |
+| `API_KEY` | Yes | LLM API key |
+| `MODEL_ID` | No | LLM model ID. Default: `llama-3.3-70b-versatile` |
 
 ### Modal Secret
 
@@ -198,9 +204,8 @@ All environment variables must be stored as a Modal Secret named `parser-secret`
 ```bash
 uv run modal secret create parser-secret \
   API_KEY=sk-your-key-here \
-  GROQ_API_KEY=gsk_xxxxxxxxxxxx \
-  GROQ_BASE_URL=https://api.groq.com/openai/v1 \
-  GROQ_MODEL_ID=llama-3.3-70b-versatile
+  BASE_URL=https://api.groq.com/openai/v1 \
+  MODEL_ID=llama-3.3-70b-versatile
 ```
 
 To update an existing secret:
@@ -208,8 +213,7 @@ To update an existing secret:
 ```bash
 uv run modal secret create parser-secret --force \
   API_KEY=sk-new-key \
-  GROQ_API_KEY=gsk_xxxxxxxxxxxx \
-  GROQ_BASE_URL=https://api.groq.com/openai/v1
+  BASE_URL=https://api.groq.com/openai/v1
 ```
 
 ---
@@ -240,16 +244,23 @@ Health check:
 curl https://<your-serve-url>/health
 ```
 
-Parse a PDF (pages 1 to 5):
+Parse a PDF (pages 1 to 5, with custom metadata):
 
 ```bash
 curl -X POST https://<your-serve-url>/parse/pdf \
   -H "X-API-Key: sk-your-key" \
   -F "file=@./sample.pdf" \
-  -F "company=ANTAM" \
-  -F "year=2024" \
+  -F 'metadata={"company":"PT Antam","year":2024,"label":"annual-report"}' \
   -F "start_page=1" \
   -F "end_page=5"
+```
+
+Parse with no metadata (all fields optional):
+
+```bash
+curl -X POST https://<your-serve-url>/parse/pdf \
+  -H "X-API-Key: sk-your-key" \
+  -F "file=@./sample.pdf"
 ```
 
 Poll status:
@@ -259,11 +270,19 @@ curl https://<your-serve-url>/status/<job_id> \
   -H "X-API-Key: sk-your-key"
 ```
 
-Retrieve result:
+Retrieve result (JSON):
 
 ```bash
 curl https://<your-serve-url>/result/<job_id> \
   -H "X-API-Key: sk-your-key"
+```
+
+Download JSONL file:
+
+```bash
+curl -O -J https://<your-serve-url>/download/<job_id> \
+  -H "X-API-Key: sk-your-key"
+# saves: sample_20260318_090455.jsonl
 ```
 
 ### Interactive API docs
@@ -325,7 +344,9 @@ To change GPU type, update the variable and redeploy.
 
 ### Modal Volume
 
-Parsed output files (JSONL) are stored in a Modal Volume named `parser-results`. To inspect:
+Parsed output files (JSONL) are stored in a Modal Volume named `parser-results`. Output filenames follow the pattern `{original_name}_{YYYYMMDD_HHMMSS}.jsonl`, e.g. `sample_20260318_090455.jsonl`.
+
+To list all output files:
 
 ```bash
 uv run modal volume ls parser-results
@@ -334,7 +355,14 @@ uv run modal volume ls parser-results
 To download a specific output file:
 
 ```bash
-uv run modal volume get parser-results ANTAM_2024_report.jsonl ./local_output/
+uv run modal volume get parser-results sample_20260318_090455.jsonl ./local_output/
+```
+
+Or use the API directly:
+
+```bash
+curl -O -J https://<your-serve-url>/download/<job_id> \
+  -H "X-API-Key: sk-your-key"
 ```
 
 ---
@@ -353,15 +381,14 @@ Parse a PDF annual report.
 
 **Form parameters:**
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `file` | file | Yes | PDF file |
-| `company` | string | Yes | Company name, e.g. `PT Antam` |
-| `year` | integer | Yes | Report year, e.g. `2024` |
-| `start_page` | integer | No | Start page, 1-indexed inclusive |
-| `end_page` | integer | No | End page, 1-indexed inclusive |
-| `enable_rotate` | boolean | No | Auto-detect and correct page rotation |
-| `enable_crop` | boolean | No | Auto-crop whitespace margins |
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `file` | file | Yes | — | PDF file (`.pdf`) |
+| `metadata` | string (JSON) | No | `{}` | Arbitrary key-value metadata as a JSON string, e.g. `{"company":"PT Antam","year":2024,"label":"annual-report"}` |
+| `start_page` | integer | No | `null` | Start page, 1-indexed inclusive |
+| `end_page` | integer | No | `null` | End page, 1-indexed inclusive |
+| `enable_rotate` | boolean | No | `false` | Auto-detect and correct page rotation |
+| `enable_crop` | boolean | No | `false` | Auto-crop whitespace margins |
 
 **Response 202:**
 
@@ -390,13 +417,12 @@ Parse a single image file (JPG, PNG, TIFF, BMP).
 
 **Form parameters:**
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `file` | file | Yes | Image file |
-| `company` | string | Yes | Company name |
-| `year` | integer | Yes | Report year |
-| `enable_rotate` | boolean | No | Auto-detect and correct image rotation |
-| `enable_crop` | boolean | No | Auto-crop whitespace margins |
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `file` | file | Yes | — | Image file (`.jpg`, `.jpeg`, `.png`, `.tiff`, `.bmp`) |
+| `metadata` | string (JSON) | No | `{}` | Arbitrary key-value metadata as a JSON string |
+| `enable_rotate` | boolean | No | `false` | Auto-detect and correct image rotation |
+| `enable_crop` | boolean | No | `false` | Auto-crop whitespace margins |
 
 **Response 202:** Same structure as `/parse/pdf`.
 
@@ -422,7 +448,7 @@ Poll the status of a submitted job.
   "job_id": "fc-01KKWGK5XF08SGJQKVXD0DBQ3M",
   "status": "done",
   "element_count": 342,
-  "output_path": "PT_Antam_2024_report.jsonl"
+  "output_path": "sample_20260318_090455.jsonl"
 }
 ```
 
@@ -457,6 +483,22 @@ Retrieve the full parsed element list. Only call after `/status` returns `done`.
 
 ---
 
+### GET /download/{job_id}
+
+Download the generated JSONL output file for a completed job. The file is streamed directly from the Modal results volume.
+
+> **Note:** Returns 202 if the job is still processing, 404 if the file is not found or the job has expired.
+
+**Response 200 — JSONL file download:**
+
+```bash
+curl -O -J https://<your-serve-url>/download/fc-01KKWGK5XF08SGJQKVXD0DBQ3M \
+  -H "X-API-Key: sk-your-key"
+# saves: sample_20260318_090455.jsonl
+```
+
+---
+
 ### GET /health
 
 Returns service health. No authentication required.
@@ -473,15 +515,14 @@ Each element in the `elements` array follows this structure:
 
 ```json
 {
+  "id": "a3f8d2c1e4b7...64-char-sha256-hex",
   "element_type": "text",
   "label": "paragraph",
   "content": "Laporan Posisi Keuangan Konsolidasian...",
   "table_markdown": null,
   "full_content": "Full aggregated text of all elements on this page...",
   "metadata": {
-    "source": "ANTAM_801_821.pdf",
-    "company": "PT Antam",
-    "year": 2024,
+    "source": "sample.pdf",
     "doc_ref": "#/texts/2",
     "page": 5,
     "pages": [5],
@@ -491,7 +532,9 @@ Each element in the `elements` array follows this structure:
       "r": 540.1,
       "b": 145.8
     },
-    "level": 1
+    "company": "PT Antam",
+    "year": 2024,
+    "label": "annual-report"
   }
 }
 ```
@@ -504,6 +547,14 @@ Each element in the `elements` array follows this structure:
 | `heading` | Section header detected by layout model |
 | `table` | Extracted table. `content` and `table_markdown` contain Markdown |
 | `figure` | Image or chart. `content` contains LLM-generated description |
+
+### id field
+
+Each element has a deterministic `id` — a SHA-256 hex digest computed from `source + doc_ref + element_type + content`. The same document and content always produce the same `id`, making elements safe to deduplicate or cross-reference across runs.
+
+### metadata field
+
+The `metadata` object always contains `source`, `doc_ref`, `page`, `pages`, and `bbox`. All additional fields (e.g. `company`, `year`, `label`, `type`) come directly from the `metadata` JSON string submitted at request time — there are no hardcoded fields. Any keys the caller passes will be stored on every element.
 
 ### full_content field
 

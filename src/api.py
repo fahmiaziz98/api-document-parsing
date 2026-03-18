@@ -1,8 +1,12 @@
+import json
+import os
+
 import modal
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from loguru import logger
 
+from src.modal_app import results_volume
 from src.models.response import JobStatusEnum, JobSubmitted
 from src.utils.auth import verify_api_key
 
@@ -55,8 +59,7 @@ async def health():
 )
 async def parse_pdf_endpoint(
     file: UploadFile = File(...),  # noqa: B008
-    company: str = Form(...),
-    year: int = Form(...),
+    metadata: str = Form("{}"),
     start_page: str | None = Form(None),
     end_page: str | None = Form(None),
     enable_rotate: bool = Form(False),
@@ -68,8 +71,8 @@ async def parse_pdf_endpoint(
 
     Args:
         file (UploadFile): File to parse
-        company (str): Company name
-        year (int): Year
+        metadata (str): JSON string of arbitrary key-value metadata
+            e.g. '{"company": "Acme", "year": 2024, "label": "annual-report"}'
         start_page (str | None): Start page
         end_page (str | None): End page
         enable_rotate (bool): Enable rotation
@@ -79,8 +82,9 @@ async def parse_pdf_endpoint(
         JSONResponse: JSON response with job status
 
     Raises:
-        HTTPException: If the file extension is not allowed
+        HTTPException: If the file extension is not allowed or metadata is invalid JSON
     """
+    metadata_dict = _parse_metadata(metadata)
     _start = optional_int(start_page)
     _end = optional_int(end_page)
 
@@ -93,8 +97,7 @@ async def parse_pdf_endpoint(
     call = await DocumentParser().parse_pdf.spawn.aio(
         file_bytes,
         file.filename,
-        company,
-        year,
+        metadata_dict,
         _start,
         _end,
         enable_rotate,
@@ -114,8 +117,7 @@ async def parse_pdf_endpoint(
 )
 async def parse_image_endpoint(
     file: UploadFile = File(...),  # noqa: B008
-    company: str = Form(...),
-    year: int = Form(...),
+    metadata: str = Form("{}"),
     enable_rotate: bool = Form(False),
     enable_crop: bool = Form(False),
 ):
@@ -125,8 +127,8 @@ async def parse_image_endpoint(
 
     Args:
         file (UploadFile): File to parse
-        company (str): Company name
-        year (int): Year
+        metadata (str): JSON string of arbitrary key-value metadata
+            e.g. '{"company": "Acme", "year": 2024, "label": "invoice"}'
         enable_rotate (bool): Enable rotation
         enable_crop (bool): Enable crop
 
@@ -134,8 +136,9 @@ async def parse_image_endpoint(
         JSONResponse: JSON response with job status
 
     Raises:
-        HTTPException: If the file extension is not allowed
+        HTTPException: If the file extension is not allowed or metadata is invalid JSON
     """
+    metadata_dict = _parse_metadata(metadata)
     _validate_ext(file.filename, IMAGE_EXTS)
     file_bytes = await _read_file(file)
 
@@ -144,8 +147,7 @@ async def parse_image_endpoint(
     call = await DocumentParser().parse_image.spawn.aio(
         file_bytes,
         file.filename,
-        company,
-        year,
+        metadata_dict,
         enable_rotate,
         enable_crop,
     )
@@ -267,6 +269,107 @@ async def get_result(job_id: str):
     except Exception as e:
         logger.error(f"Result fetch failed for job {job_id}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@web_app.get("/download/{job_id}", dependencies=[Depends(verify_api_key)])
+async def download_result(job_id: str):
+    """
+    Download the generated JSONL file for a completed parsing job.
+
+    Retrieves the output_path recorded by the Modal worker and streams
+    the file from the mounted results volume back to the caller.
+
+    Args:
+        job_id (str): Job ID
+
+    Returns:
+        FileResponse: The JSONL file as a downloadable attachment
+
+    Raises:
+        HTTPException: 202 if still processing; 404 if file not found; 500 on error
+    """
+    try:
+        result = await _get_call_result(job_id, timeout=0)
+    except TimeoutError:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": JobStatusEnum.PROCESSING,
+                "message": "Job still running, try again later",
+            },
+        )
+    except modal.exception.NotFoundError:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "job_id": job_id,
+                "status": JobStatusEnum.EXPIRED,
+                "error": "Job not found or expired (>7 days)",
+            },
+        )
+    except Exception as e:
+        logger.error(f"Download fetch failed for job {job_id}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    status_val = result.get("status", JobStatusEnum.DONE)
+    if status_val == JobStatusEnum.ERROR:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "job_id": job_id,
+                "status": JobStatusEnum.ERROR,
+                "error": result.get("error"),
+            },
+        )
+
+    output_filename = result.get("output_path")
+    if not output_filename:
+        raise HTTPException(status_code=404, detail="No output file recorded for this job.")
+
+    # Reload the volume so this container sees files committed by the worker.
+    await results_volume.reload.aio()
+
+    file_path = f"/results/{output_filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Output file '{output_filename}' not found on volume.",
+        )
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/x-ndjson",
+        filename=output_filename,
+    )
+
+
+def _parse_metadata(metadata_str: str) -> dict:
+    """
+    Parse the metadata JSON string sent as a form field.
+
+    Args:
+        metadata_str (str): Raw JSON string from the form field
+
+    Returns:
+        dict: Parsed metadata dictionary
+
+    Raises:
+        HTTPException: If the value is not valid JSON or not a JSON object
+    """
+    try:
+        parsed = json.loads(metadata_str)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"metadata must be a valid JSON string: {e}",
+        ) from e
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="metadata must be a JSON object (key-value pairs)",
+        )
+    return parsed
 
 
 def _validate_ext(filename: str, allowed: set[str]) -> None:

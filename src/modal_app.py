@@ -1,5 +1,6 @@
 import json
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import fitz
@@ -29,11 +30,6 @@ image = (
         "numpy",
         "pymupdf",
     )
-    #    .env({
-    #        "HF_HOME":            "/root/model-cache/huggingface",
-    #        "DOCLING_CACHE_DIR":  "/root/model-cache/docling-models",
-    #        "TORCH_HOME":         "/root/model-cache/torch",
-    #    })
     .add_local_dir("src", remote_path="/root/src")
 )
 
@@ -77,13 +73,48 @@ class DocumentParser:
 
         logger.info("DocumentParser models loaded and ready")
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _finish_parse(self, doc, metadata: dict, filename: str) -> dict:
+        """
+        Shared post-conversion step: export elements, persist to JSONL, return result dict.
+
+        Extracted to eliminate the identical tail block that was duplicated in both
+        ``parse_pdf`` and ``parse_image``.
+
+        Args:
+            doc: Docling document object produced by a converter.
+            metadata: Arbitrary user-supplied metadata dict.
+            filename: Original uploaded filename (used for export and output naming).
+
+        Returns:
+            dict: Result payload with status, element_count, output_path, and elements.
+        """
+        from src.core.exporter import export_raw_elements
+        from src.models.response import JobStatusEnum
+
+        elements = export_raw_elements(doc, metadata, filename)
+        output_filename = _save_jsonl(elements, filename)
+        logger.info(
+            f"Parsed: texts={len(doc.texts)} "
+            f"tables={len(doc.tables)} "
+            f"pictures={len(doc.pictures)}"
+        )
+        return {
+            "status": JobStatusEnum.DONE,
+            "element_count": len(elements),
+            "output_path": output_filename,
+            "elements": elements,
+        }
+
     @modal.method()
     def parse_pdf(
         self,
         file_bytes: bytes,
         filename: str,
-        company: str,
-        year: int,
+        metadata: dict,
         start_page: int | None = None,
         end_page: int | None = None,
         enable_rotate: bool = False,
@@ -95,8 +126,7 @@ class DocumentParser:
         Args:
             file_bytes: Bytes of the PDF file
             filename: Filename
-            company: Company name
-            year: Year
+            metadata: Arbitrary user-supplied metadata (e.g. company, year, label, type…)
             start_page: Start page
             end_page: End page
             enable_rotate: Enable auto-rotation
@@ -105,7 +135,6 @@ class DocumentParser:
         Returns:
             dict: Job status and results
         """
-        from src.core.exporter import export_raw_elements
         from src.core.preprocess import preprocess_pdf
         from src.models.response import JobStatusEnum
 
@@ -144,23 +173,7 @@ class DocumentParser:
                     convert_kwargs["page_range"] = page_range
 
                 result = self.pdf_converter.convert(**convert_kwargs)
-                doc = result.document
-
-                logger.info(
-                    f"PDF parsed: texts={len(doc.texts)} "
-                    f"tables={len(doc.tables)} "
-                    f"pictures={len(doc.pictures)}"
-                )
-
-                elements = export_raw_elements(doc, company, year, filename)
-                output_filename = _save_jsonl(elements, company, year, filename)
-
-                return {
-                    "status": JobStatusEnum.DONE,
-                    "element_count": len(elements),
-                    "output_path": output_filename,
-                    "elements": elements,
-                }
+                return self._finish_parse(result.document, metadata, filename)
 
         except Exception as e:
             logger.error("parse_pdf failed", exc_info=True)
@@ -171,8 +184,7 @@ class DocumentParser:
         self,
         file_bytes: bytes,
         filename: str,
-        company: str,
-        year: int,
+        metadata: dict,
         enable_rotate: bool = False,
         enable_crop: bool = False,
     ) -> dict:
@@ -182,15 +194,13 @@ class DocumentParser:
         Args:
             file_bytes: Bytes of the image file
             filename: Filename
-            company: Company name
-            year: Year
+            metadata: Arbitrary user-supplied metadata (e.g. company, year, label, type…)
             enable_rotate: Enable auto-rotation
             enable_crop: Enable content cropping
 
         Returns:
             dict: Job status and results
         """
-        from src.core.exporter import export_raw_elements
         from src.core.preprocess import preprocess_image
         from src.models.response import JobStatusEnum
 
@@ -215,43 +225,30 @@ class DocumentParser:
                         )
 
                 result = self.image_converter.convert(str(input_path), raises_on_error=False)
-                doc = result.document
-
-                logger.info(
-                    f"Image parsed: texts={len(doc.texts)} "
-                    f"tables={len(doc.tables)} "
-                    f"pictures={len(doc.pictures)}"
-                )
-
-                elements = export_raw_elements(doc, company, year, filename)
-                output_filename = _save_jsonl(elements, company, year, filename)
-
-                return {
-                    "status": JobStatusEnum.DONE,
-                    "element_count": len(elements),
-                    "output_path": output_filename,
-                    "elements": elements,
-                }
+                return self._finish_parse(result.document, metadata, filename)
 
         except Exception as e:
             logger.error("parse_image failed", exc_info=True)
             return {"status": JobStatusEnum.ERROR, "error": str(e)}
 
 
-def _save_jsonl(elements: list[dict], company: str, year: int, filename: str) -> str:
+def _save_jsonl(elements: list[dict], filename: str) -> str:
     """
     Save elements to a JSONL file.
 
+    The output filename is derived from the original file stem combined with
+    the current timestamp: ``{stem}_{YYYYMMDD_HHMMSS}.jsonl``.
+    For example, ``data.pdf`` → ``data_20260318_082054.jsonl``.
+
     Args:
         elements: List of elements to save
-        company: Company name
-        year: Year
-        filename: Filename
+        filename: Original uploaded filename
 
     Returns:
-        Output filename
+        Output filename (relative, not full path)
     """
-    output_filename = f"{company}_{year}_{Path(filename).stem}.jsonl"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_filename = f"{Path(filename).stem}_{timestamp}.jsonl"
     output_path = Path(VOLUME_MOUNT) / output_filename
     with open(output_path, "w", encoding="utf-8") as f:
         for el in elements:

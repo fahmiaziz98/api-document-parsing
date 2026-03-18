@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class JobStatusEnum(StrEnum):
@@ -48,11 +48,16 @@ class JobStatus(BaseModel):
 
 
 class ElementMetadata(BaseModel):
-    """Metadata detailing the origin and bounding box of an extracted element."""
+    """Metadata detailing the origin and bounding box of an extracted element.
+
+    Supports arbitrary user-defined fields (e.g. company, year, label, type) via
+    Pydantic's extra='allow' config, so consumers can pass any key-value metadata
+    they require at submission time.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     source: str = Field(..., description="Original filename of the document.")
-    company: str = Field(..., description="Company name associated with the document.")
-    year: int = Field(..., description="Reporting year of the document.")
     doc_ref: str = Field(..., description="Internal document reference ID from the parser.")
     page: int = Field(
         ..., description="Primary page number where the element is found (1-indexed)."
@@ -66,6 +71,10 @@ class ElementMetadata(BaseModel):
 class Element(BaseModel):
     """A single extracted logical element from the document (e.g., text block, table, figure)."""
 
+    id: str = Field(
+        ...,
+        description="Deterministic SHA-256 id derived from source, doc_ref, element_type, and content.",
+    )
     element_type: ElementTypeEnum = Field(
         ..., description="The semantic classification of the element."
     )

@@ -33,16 +33,16 @@ OCR_BATCH = 64
 
 def _picture_description_options() -> PictureDescriptionApiOptions | None:
     """Configure Picture Description options using Groq API, gracefully failing if keys are missing."""
-    groq_url = os.getenv("GROQ_BASE_URL")
-    groq_key = os.getenv("GROQ_API_KEY")
+    groq_url = os.getenv("BASE_URL")
+    groq_key = os.getenv("API_KEY")
 
     if not groq_url or not groq_key:
         logger.warning(
-            "GROQ_BASE_URL or GROQ_API_KEY not set. Picture description will be disabled."
+            "BASE_URL or API_KEY not set. Picture description will be disabled."
         )
         return None
 
-    groq_model = os.getenv("GROQ_MODEL_ID", "llama-3.3-70b-versatile")
+    groq_model = os.getenv("MODEL_ID", "llama-3.3-70b-versatile")
 
     return PictureDescriptionApiOptions(
         url=f"{groq_url}/chat/completions",
@@ -56,12 +56,17 @@ def _picture_description_options() -> PictureDescriptionApiOptions | None:
     )
 
 
-def build_pdf_converter() -> DocumentConverter:
+def _build_pipeline_options() -> ThreadedPdfPipelineOptions:
     """
-    Build the full Docling pipeline for PDF parsing.
-    Includes SuryaOCR, TableFormer, layout heron, and optional picture description.
+    Build the shared Docling pipeline options used by both PDF and image converters.
+
+    Configures SuryaOCR, CUDA acceleration, layout (Heron), TableFormer (ACCURATE),
+    and optionally enables picture description via the Groq API if credentials are set.
+
+    Returns:
+        ThreadedPdfPipelineOptions: Fully configured pipeline options object.
     """
-    pipeline_options = ThreadedPdfPipelineOptions(
+    options = ThreadedPdfPipelineOptions(
         do_ocr=True,
         ocr_model="suryaocr",
         allow_external_plugins=True,
@@ -75,20 +80,32 @@ def build_pdf_converter() -> DocumentConverter:
         ocr_batch_size=OCR_BATCH,
         enable_remote_services=True,
     )
-    pipeline_options.layout_options = LayoutOptions(model_spec=DOCLING_LAYOUT_HERON)
-    pipeline_options.do_table_structure = True
-    pipeline_options.table_structure_options = TableStructureOptions(
+    options.layout_options = LayoutOptions(model_spec=DOCLING_LAYOUT_HERON)
+    options.do_table_structure = True
+    options.table_structure_options = TableStructureOptions(
         mode=TableFormerMode.ACCURATE,
         do_cell_matching=True,
     )
 
     pic_opts = _picture_description_options()
+    options.do_picture_description = pic_opts is not None
     if pic_opts:
-        pipeline_options.do_picture_description = True
-        pipeline_options.picture_description_options = pic_opts
-    else:
-        pipeline_options.do_picture_description = False
+        options.picture_description_options = pic_opts
 
+    return options
+
+
+def build_pdf_converter() -> DocumentConverter:
+    """
+    Build the Docling DocumentConverter for PDF parsing.
+
+    Uses the shared pipeline options with a PdfFormatOption and
+    ThreadedStandardPdfPipeline for multi-threaded PDF processing.
+
+    Returns:
+        DocumentConverter: Ready-to-use PDF converter.
+    """
+    pipeline_options = _build_pipeline_options()
     converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(
@@ -103,38 +120,15 @@ def build_pdf_converter() -> DocumentConverter:
 
 def build_image_converter() -> DocumentConverter:
     """
-    Build the full Docling pipeline for image parsing.
-    Includes SuryaOCR, TableFormer, layout heron, and optional picture description.
+    Build the Docling DocumentConverter for image parsing.
+
+    Uses the shared pipeline options with an ImageFormatOption
+    for direct image-to-document conversion.
+
+    Returns:
+        DocumentConverter: Ready-to-use image converter.
     """
-
-    pipeline_options = ThreadedPdfPipelineOptions(
-        do_ocr=True,
-        ocr_model="suryaocr",
-        allow_external_plugins=True,
-        ocr_options=SuryaOcrOptions(lang=["en", "id"], force_full_page_ocr=False),
-        accelerator_options=AcceleratorOptions(
-            device=AcceleratorDevice.CUDA,
-            num_threads=8,
-        ),
-        layout_batch_size=LAYOUT_BATCH,
-        table_batch_size=TABLE_BATCH,
-        ocr_batch_size=OCR_BATCH,
-        enable_remote_services=True,
-    )
-    pipeline_options.layout_options = LayoutOptions(model_spec=DOCLING_LAYOUT_HERON)
-    pipeline_options.do_table_structure = True
-    pipeline_options.table_structure_options = TableStructureOptions(
-        mode=TableFormerMode.ACCURATE,
-        do_cell_matching=True,
-    )
-
-    pic_opts = _picture_description_options()
-    if pic_opts:
-        pipeline_options.do_picture_description = True
-        pipeline_options.picture_description_options = pic_opts
-    else:
-        pipeline_options.do_picture_description = False
-
+    pipeline_options = _build_pipeline_options()
     converter = DocumentConverter(
         format_options={
             InputFormat.IMAGE: ImageFormatOption(

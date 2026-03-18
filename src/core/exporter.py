@@ -1,9 +1,30 @@
+import hashlib
 from collections import defaultdict
 
 from docling_core.types.doc.labels import DocItemLabel
 from loguru import logger
 
 from src.models.response import ElementTypeEnum
+
+
+def _make_element_id(source: str, doc_ref: str, element_type: str, content: str) -> str:
+    """
+    Generate a deterministic SHA-256 id for an element.
+
+    The hash is computed from the stable tuple (source, doc_ref, element_type, content)
+    so the same document content always produces the same id, enabling deduplication.
+
+    Args:
+        source: Original filename of the document.
+        doc_ref: Internal document reference string from the parser.
+        element_type: Semantic type of the element (text, heading, table, figure).
+        content: Extracted text or table markdown content.
+
+    Returns:
+        Hex-encoded SHA-256 digest (64 characters).
+    """
+    raw = f"{source}|{doc_ref}|{element_type}|{content}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _extract_bbox(prov: list) -> dict[str, float] | None:
@@ -79,10 +100,15 @@ def _process_picture_element(item, text: str, base_meta: dict) -> dict:
     }
 
 
-def export_raw_elements(doc, company: str, year: int, source: str) -> list[dict]:
+def export_raw_elements(doc, metadata: dict, source: str) -> list[dict]:
     """
     Export raw elements extracted by Docling into a structured dictionary format.
     Iterates over all parsed document items, extracting text, tables, and images.
+
+    Args:
+        doc: Docling document object
+        metadata: Arbitrary user-supplied metadata dict (e.g. company, year, label, type…)
+        source: Original filename of the document
     """
     records = []
 
@@ -97,12 +123,11 @@ def export_raw_elements(doc, company: str, year: int, source: str) -> list[dict]
 
         base_meta = {
             "source": source,
-            "company": company,
-            "year": year,
             "doc_ref": ref,
             "page": page,
             "pages": pages,
             "bbox": bbox,
+            **metadata,  # spread all user-supplied metadata fields
         }
 
         if label in (
@@ -131,6 +156,17 @@ def export_raw_elements(doc, company: str, year: int, source: str) -> list[dict]
     for r in records:
         p = r["metadata"]["page"]
         r["full_content"] = "\n\n".join(page_contents.get(p, []))
+        # Inject a deterministic id as the first field of each element.
+        element_id = _make_element_id(
+            source=r["metadata"]["source"],
+            doc_ref=r["metadata"]["doc_ref"],
+            element_type=r["element_type"],
+            content=r["content"],
+        )
+        r["id"] = element_id
+        # Re-order so id comes first for readability.
+        ordered = {"id": r.pop("id"), **r}
+        records[records.index(r)] = ordered
 
     logger.info(f"Exported {len(records)} elements from doc ({len(page_contents)} pages)")
     return records

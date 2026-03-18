@@ -7,7 +7,8 @@ import fitz
 import modal
 from loguru import logger
 
-app = modal.App("annual-report-parser")
+app = modal.App("api-document-parsing")
+GPU_CONFIG = "A10G"
 
 results_volume = modal.Volume.from_name("parser-results", create_if_missing=True)
 model_volume = modal.Volume.from_name("docling-models", create_if_missing=True)
@@ -36,7 +37,7 @@ image = (
 
 @app.cls(
     image=image,
-    gpu="A10G",
+    gpu=GPU_CONFIG,
     timeout=1800,
     secrets=[modal.Secret.from_name("parser-secret")],
     volumes={

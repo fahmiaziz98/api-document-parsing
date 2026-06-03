@@ -25,7 +25,7 @@ A production-grade REST API for parsing bilingual (Indonesian/English) documents
 
 ## Overview
 
-This service accepts PDF or image files containing documents and returns structured JSON elements including text, tables (as Markdown), and figure descriptions. Each element carries a deterministic SHA-256 `id` and full provenance metadata (page number, bounding box, and any user-supplied key-value fields).
+This service accepts PDF or image files containing documents and returns structured JSON elements including text, tables (as Markdown), and figure descriptions.
 
 Key capabilities:
 
@@ -102,7 +102,7 @@ api-document-parsing/
 |   |
 |   |-- api/
 |   |   |-- __init__.py
-|   |   |-- health.py         # GET /health, GET /ready endpoints
+|   |   |-- health.py         # GET /health
 |   |   |
 |   |   `-- v1/
 |   |       |-- __init__.py
@@ -144,13 +144,12 @@ api-document-parsing/
 |   |-- SYSTEM_DESIGN.md      # Architecture and design decisions
 |   |-- DEVELOPER_GUIDE.md    # Detailed development guide
 |   |-- DEPLOYMENT_CHECKLIST.md
-|   |-- TESTING_GUIDE.md
+|
 |
 |-- deploy.py                 # Modal deploy entry point
 |-- generated_secret.py       # CLI tool for API key generation
 |-- pyproject.toml
 |-- .env.example
-|-- FINAL_STATUS_REPORT.md    # Project completion status
 `-- README.md
 ```
 

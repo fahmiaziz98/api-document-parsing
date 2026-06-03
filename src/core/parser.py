@@ -58,13 +58,14 @@ def _picture_description_options() -> PictureDescriptionApiOptions | None:
 
 def _build_pipeline_options() -> ThreadedPdfPipelineOptions:
     """
-    Build the shared Docling pipeline options used by both PDF and image converters.
+    Build Docling pipeline options specifically for PDF/IMAGE conversion.
 
-    Configures SuryaOCR, CUDA acceleration, layout (Heron), TableFormer (ACCURATE),
-    and optionally enables picture description via the Groq API if credentials are set.
+    Uses ThreadedPdfPipelineOptions with SuryaOCR, CUDA acceleration,
+    Heron layout model, and TableFormer ACCURATE mode.
+    Optionally enables picture description via OpenAI-compatible API.
 
     Returns:
-        ThreadedPdfPipelineOptions: Fully configured pipeline options object.
+        ThreadedPdfPipelineOptions: Fully configured pipeline options for PDF.
     """
     options = ThreadedPdfPipelineOptions(
         do_ocr=True,
@@ -99,7 +100,7 @@ def build_pdf_converter() -> DocumentConverter:
     """
     Build the Docling DocumentConverter for PDF parsing.
 
-    Uses the shared pipeline options with a PdfFormatOption and
+    Uses ThreadedPdfPipelineOptions with PdfFormatOption and
     ThreadedStandardPdfPipeline for multi-threaded PDF processing.
 
     Returns:
@@ -122,8 +123,9 @@ def build_image_converter() -> DocumentConverter:
     """
     Build the Docling DocumentConverter for image parsing.
 
-    Uses the shared pipeline options with an ImageFormatOption
-    for direct image-to-document conversion.
+    Uses standard PipelineOptions (not ThreadedPdfPipelineOptions) with
+    ImageFormatOption. ThreadedPdfPipelineOptions is PDF-specific and causes
+    type errors when passed to ImageFormatOption.
 
     Returns:
         DocumentConverter: Ready-to-use image converter.

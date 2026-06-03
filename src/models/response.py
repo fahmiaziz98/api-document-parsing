@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
 
 class JobStatusEnum(StrEnum):
@@ -14,7 +14,7 @@ class JobStatusEnum(StrEnum):
 
 
 class ElementTypeEnum(StrEnum):
-    """Enumeration of extracted document element types."""
+    """Enumeration of possible element types in a parsed PDF."""
 
     TEXT = "text"
     HEADING = "heading"
@@ -47,56 +47,57 @@ class JobStatus(BaseModel):
     error: str | None = Field(None, description="Error message if the job failed.")
 
 
-class ElementMetadata(BaseModel):
-    """Metadata detailing the origin and bounding box of an extracted element.
+class PageContent(BaseModel):
+    """Content extracted from a single page."""
 
-    Supports arbitrary user-defined fields (e.g. company, year, label, type) via
-    Pydantic's extra='allow' config, so consumers can pass any key-value metadata
-    they require at submission time.
+    page: int = Field(..., description="Page number (1-indexed).")
+    content: str = Field(..., description="Aggregated text content for this page.")
+
+
+class PageTableMarkdown(BaseModel):
+    """Table markdown extracted from a single page."""
+
+    page: int = Field(..., description="Page number (1-indexed).")
+    content: str = Field(..., description="Markdown representation of the table.")
+
+
+class ImageParseResult(BaseModel):
     """
+    Response model for parsed image files.
 
-    model_config = ConfigDict(extra="allow")
-
-    source: str = Field(..., description="Original filename of the document.")
-    doc_ref: str = Field(..., description="Internal document reference ID from the parser.")
-    page: int = Field(
-        ..., description="Primary page number where the element is found (1-indexed)."
-    )
-    pages: list[int] = Field(..., description="List of all page numbers spanned by the element.")
-    bbox: dict[str, float] | None = Field(
-        None, description="Bounding box coordinates (l, t, r, b) of the element."
-    )
-
-
-class Element(BaseModel):
-    """A single extracted logical element from the document (e.g., text block, table, figure)."""
-
-    id: str = Field(
-        ...,
-        description="Deterministic SHA-256 id derived from source, doc_ref, element_type, and content.",
-    )
-    element_type: ElementTypeEnum = Field(
-        ..., description="The semantic classification of the element."
-    )
-    label: str = Field(..., description="Original parser label (e.g., DocItemLabel value).")
-    content: str = Field(..., description="Extracted text content or table representation.")
-    table_markdown: str | None = Field(
-        None, description="Markdown format of the table, if the element is a table."
-    )
-    full_content: str | None = Field(
-        None, description="Aggregated full content for the page this element is on (injected)."
-    )
-    metadata: ElementMetadata = Field(
-        ..., description="Metadata and positioning info for the element."
-    )
-
-
-class ParseResult(BaseModel):
-    """Response model containing all parsed elements and final job status."""
+    Images are always single-page, so full_content and table_markdown
+    are flat strings rather than per-page lists.
+    """
 
     job_id: str = Field(..., description="Unique identifier for the Modal job.")
     status: JobStatusEnum = Field(
         default=JobStatusEnum.DONE, description="Final status of the job."
     )
-    element_count: int = Field(..., description="Total number of elements extracted.")
-    elements: list[Element] = Field(..., description="List of extracted elements.")
+    page_count: int = Field(default=1, description="Always 1 for image inputs.")
+    full_content: str | None = Field(None, description="All extracted text from the image.")
+    table_markdown: str | None = Field(
+        None, description="Markdown table if a table was detected, otherwise null."
+    )
+
+
+class PdfParseResult(BaseModel):
+    """
+    Response model for parsed PDF files.
+
+    PDFs can be multi-page, so full_content and table_markdown
+    are per-page lists. table_markdown is an empty list if no tables found.
+    """
+
+    job_id: str = Field(..., description="Unique identifier for the Modal job.")
+    status: JobStatusEnum = Field(
+        default=JobStatusEnum.DONE, description="Final status of the job."
+    )
+    page_count: int = Field(..., description="Total number of pages parsed.")
+    full_content: list[PageContent] = Field(
+        default_factory=list,
+        description="Aggregated text content per page.",
+    )
+    table_markdown: list[PageTableMarkdown] = Field(
+        default_factory=list,
+        description="Markdown tables per page. Empty list if no tables found.",
+    )

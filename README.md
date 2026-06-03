@@ -1,6 +1,6 @@
 # API Document Parsing
 
-A production-grade REST API for parsing bilingual (Indonesian/English) documents from PDF and image formats. Built on Docling, deployed on Modal.com with GPU acceleration.
+A production-grade REST API for parsing bilingual (Indonesian/English) documents from PDF and image formats. Built on Docling, deployed on [Modal.com](https://modal.com) with GPU acceleration.
 
 ---
 

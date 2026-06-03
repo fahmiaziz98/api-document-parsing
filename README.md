@@ -51,9 +51,11 @@ Client
   |-- Auth: X-API-Key header validation
   |-- Input validation: file type, metadata JSON, page range
   |
+  [/parse/pdf path]
+  |
   Function.spawn() --> GPU Container (A10G)
                          |
-                         |-- preprocess_pdf() / preprocess_image()
+                         |-- preprocess_pdf()
                          |     PyMuPDF: set_rotation(), set_cropbox()
                          |     Vision: RotationDetector, ContentCropper
                          |
@@ -64,17 +66,25 @@ Client
                          |     PictureDescriptionApiOptions -> LLM
                          |
                          |-- export_raw_elements()
-                         |     Per-element: SHA-256 id, text, table, figure
-                         |     Per-element: user metadata merged in
-                         |     Per-page: full_content aggregation
                          |
                          --> JSONL saved to Modal Volume
-                              ({filename}_{YYYYMMDD_HHMMSS}.jsonl)
   |
   GET /status/{job_id}   --> Poll until done
-  GET /result/{job_id}   --> Retrieve full element list (JSON)
+  GET /result/{job_id}   --> Retrieve full element list
   GET /download/{job_id} --> Download JSONL file
+
+  [/parse/image path — synchronous, no polling]
+  |
+  Function.call() --> GPU Container (A10G)  [immediate invocation, waits for result]
+                         |
+                         |-- preprocess_image()
+                         |-- Docling converter (same as PDF)
+                         |-- export_raw_elements()
+                         |-- JSONL saved
+                         |
+                         --> Returns parsed elements immediately (200)
 ```
+
 
 ---
 
@@ -266,7 +276,18 @@ curl -X POST https://<your-serve-url>/parse/pdf \
   -F "file=@./sample.pdf"
 ```
 
-Poll status:
+Parse a single image (returns result immediately, no polling):
+
+```bash
+curl -X POST https://<your-serve-url>/parse/image \
+  -H "X-API-Key: sk-your-key" \
+  -F "file=@./invoice.jpg" \
+  -F 'metadata={"doc_type":"invoice","year":2024}'
+```
+
+The image response includes parsed elements directly — no job_id polling needed.
+
+Poll status (PDF only):
 
 ```bash
 curl https://<your-serve-url>/status/<job_id> \
@@ -416,7 +437,9 @@ Parse a PDF annual report.
 
 ### POST /parse/image
 
-Parse a single image file (JPG, PNG, TIFF, BMP).
+Parse a single image file (JPG, PNG, TIFF, BMP) and return results immediately.
+
+Unlike `/parse/pdf` which uses background jobs, single images are parsed synchronously with no polling required.
 
 **Form parameters:**
 
@@ -427,7 +450,29 @@ Parse a single image file (JPG, PNG, TIFF, BMP).
 | `enable_rotate` | boolean | No | `false` | Auto-detect and correct image rotation |
 | `enable_crop` | boolean | No | `false` | Auto-crop whitespace margins |
 
-**Response 202:** Same structure as `/parse/pdf`.
+**Response 200 — immediate result:**
+
+```json
+{
+  "job_id": "tracking-uuid",
+  "status": "done",
+  "element_count": 45,
+  "elements": [
+    {
+      "id": "a3f8d2c1e4b7...64-char-sha256-hex",
+      "element_type": "text",
+      "label": "paragraph",
+      "content": "Extracted text from image...",
+      "table_markdown": null,
+      "full_content": "...",
+      "metadata": { ... }
+    },
+    ...
+  ]
+}
+```
+
+No polling needed — results are available in the same request.
 
 ---
 

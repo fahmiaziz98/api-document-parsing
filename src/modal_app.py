@@ -18,8 +18,8 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("libgl1", "libglib2.0-0", "libsm6", "libxext6", "libxrender-dev")
     .pip_install(
-        "docling",
-        "docling-surya",
+        "docling>=1.4.0",
+        "docling-surya>=0.1.0",
         "openai",
         "fastapi",
         "python-multipart",
@@ -30,6 +30,7 @@ image = (
         "opencv-python-headless",
         "numpy",
         "pymupdf",
+        "transformers>=4.40.0",
     )
     .add_local_dir("src", remote_path="/root/src")
 )
@@ -69,8 +70,37 @@ class DocumentParser:
         setup_logging()
         logger.info("DocumentParser container starting — loading models...")
 
-        self.pdf_converter = build_pdf_converter()
-        self.image_converter = build_image_converter()
+        try:
+            self.pdf_converter = build_pdf_converter()
+            logger.info("PDF converter loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load PDF converter: {e}", exc_info=True)
+            raise
+
+        try:
+            self.image_converter = build_image_converter()
+            logger.info("Image converter loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load image converter: {e}", exc_info=True)
+            # Try fallback without force_full_page_ocr
+            logger.warning("Attempting image converter with fallback OCR options...")
+            try:
+                from src.core.parser import _build_pipeline_options
+                from docling.datamodel.base_models import InputFormat
+                from docling.document_converter import DocumentConverter, ImageFormatOption
+
+                pipeline_options = _build_pipeline_options()
+                self.image_converter = DocumentConverter(
+                    format_options={
+                        InputFormat.IMAGE: ImageFormatOption(
+                            pipeline_options=pipeline_options,
+                        ),
+                    }
+                )
+                logger.info("Image converter loaded with fallback options")
+            except Exception as fallback_error:
+                logger.error(f"Fallback image converter also failed: {fallback_error}", exc_info=True)
+                raise
 
         logger.info("DocumentParser models loaded and ready")
 

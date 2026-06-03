@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 
 import modal
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -7,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from loguru import logger
 
 from src.modal_app import results_volume
-from src.models.response import JobStatusEnum, JobSubmitted
+from src.models.response import JobStatusEnum, JobSubmitted, ParseResult
 from src.utils.auth import verify_api_key
 
 web_app = FastAPI(
@@ -111,8 +112,8 @@ async def parse_pdf_endpoint(
 
 @web_app.post(
     "/parse/image",
-    response_model=JobSubmitted,
-    status_code=202,
+    response_model=ParseResult,
+    status_code=200,
     dependencies=[Depends(verify_api_key)],
 )
 async def parse_image_endpoint(
@@ -122,21 +123,23 @@ async def parse_image_endpoint(
     enable_crop: bool = Form(False),
 ):
     """
-    Submit an Image file to the Modal parsing queue.
-    Checks authorization and validates file extensions before dispatching.
+    Parse an image file directly and return results immediately.
+
+    Unlike PDF parsing which uses background jobs, single images
+    are parsed synchronously to provide fast, immediate responses.
 
     Args:
-        file (UploadFile): File to parse
+        file (UploadFile): Image file to parse
         metadata (str): JSON string of arbitrary key-value metadata
             e.g. '{"company": "Acme", "year": 2024, "label": "invoice"}'
         enable_rotate (bool): Enable rotation
         enable_crop (bool): Enable crop
 
     Returns:
-        JSONResponse: JSON response with job status
+        ParseResult: Parsed elements with status and metadata
 
     Raises:
-        HTTPException: If the file extension is not allowed or metadata is invalid JSON
+        HTTPException: If file validation or parsing fails
     """
     metadata_dict = _parse_metadata(metadata)
     _validate_ext(file.filename, IMAGE_EXTS)
@@ -144,17 +147,36 @@ async def parse_image_endpoint(
 
     from src.modal_app import DocumentParser
 
-    call = await DocumentParser().parse_image.spawn.aio(
-        file_bytes,
-        file.filename,
-        metadata_dict,
-        enable_rotate,
-        enable_crop,
-    )
-    return JobSubmitted(
-        job_id=call.object_id,
-        message=f"Image parsing started. Poll GET /status/{call.object_id}",
-    )
+    try:
+        # Spawn job and immediately await result — no polling needed
+        call = await DocumentParser().parse_image.spawn.aio(
+            file_bytes,
+            file.filename,
+            metadata_dict,
+            enable_rotate,
+            enable_crop,
+        )
+        result = await call.get.aio(timeout=None)
+
+        # Check if parsing failed on the Modal side
+        status_val = result.get("status", JobStatusEnum.DONE)
+        if status_val == JobStatusEnum.ERROR:
+            error_msg = result.get("error", "Unknown parsing error")
+            logger.error(f"Image parsing failed in Modal: {error_msg}")
+            raise HTTPException(status_code=500, detail=error_msg)
+
+        # Map to ParseResult schema (exclude output_path, add tracking ID)
+        return ParseResult(
+            job_id=str(uuid.uuid4()),
+            status=status_val,
+            element_count=result.get("element_count", 0),
+            elements=result.get("elements", []),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Image parsing failed", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @web_app.get("/status/{job_id}", dependencies=[Depends(verify_api_key)])

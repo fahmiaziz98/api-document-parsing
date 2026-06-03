@@ -16,6 +16,8 @@ A production-grade REST API for parsing bilingual (Indonesian/English) documents
 - [Deployment](#deployment)
 - [API Reference](#api-reference)
 - [Output Schema](#output-schema)
+- [Documentation](#documentation)
+- [Authentication Setup (Per-Client Keys)](#authentication-setup-per-client-keys)
 - [Troubleshooting](#troubleshooting)
 - [Performance Notes](#performance-notes)
 
@@ -45,13 +47,13 @@ Key capabilities:
 ```
 Client
   |
-  POST /parse/pdf  or  POST /parse/image
+  POST /v1/parse/pdf  or  POST /v1/parse/image
   |
   FastAPI (Modal web endpoint — CPU container)
   |-- Auth: X-API-Key header validation
   |-- Input validation: file type, metadata JSON, page range
   |
-  [/parse/pdf path]
+  [/v1/parse/pdf path]
   |
   Function.spawn() --> GPU Container (A10G)
                          |
@@ -69,11 +71,11 @@ Client
                          |
                          --> JSONL saved to Modal Volume
   |
-  GET /status/{job_id}   --> Poll until done
-  GET /result/{job_id}   --> Retrieve full element list
-  GET /download/{job_id} --> Download JSONL file
+  GET /v1/jobs/{job_id}/status   --> Poll until done
+  GET /v1/jobs/{job_id}/result   --> Retrieve full element list
+  GET /v1/jobs/{job_id}/download --> Download JSONL file
 
-  [/parse/image path — synchronous, no polling]
+  [/v1/parse/image path — synchronous, no polling]
   |
   Function.call() --> GPU Container (A10G)  [immediate invocation, waits for result]
                          |
@@ -95,8 +97,18 @@ api-document-parsing/
 |
 |-- src/
 |   |-- __init__.py
+|   |-- app.py                # FastAPI app factory
 |   |-- modal_app.py          # Modal App definition, GPU functions
-|   |-- api.py                # FastAPI routes
+|   |
+|   |-- api/
+|   |   |-- __init__.py
+|   |   |-- health.py         # GET /health, GET /ready endpoints
+|   |   |
+|   |   `-- v1/
+|   |       |-- __init__.py
+|   |       |-- router.py     # Combines v1 routes
+|   |       |-- parse.py      # POST /v1/parse/pdf, POST /v1/parse/image
+|   |       `-- jobs.py       # GET /v1/jobs/{job_id}/status, /result, /download
 |   |
 |   |-- core/
 |   |   |-- __init__.py
@@ -106,24 +118,39 @@ api-document-parsing/
 |   |
 |   |-- models/
 |   |   |-- __init__.py
+|   |   |-- enums.py          # JobStatusEnum, ElementTypeEnum
 |   |   |-- request.py        # Pydantic request schemas
 |   |   `-- response.py       # Pydantic response schemas
 |   |
-|   `-- utils/
+|   |-- services/
+|   |   |-- __init__.py
+|   |   |-- parser_service.py # Orchestration logic for parsing
+|   |   `-- job_store.py      # Job metadata persistence
+|   |
+|   |-- utils/
+|   |   |-- __init__.py
+|   |   |-- auth.py           # Per-client API key validation
+|   |   |-- files.py          # File validation and parsing
+|   |   `-- logging.py        # Structured logging setup
+|   |
+|   `-- vision/               # Image preprocessing utilities
 |       |-- __init__.py
-|       |-- auth.py           # API key middleware
-|       `-- logging.py        # Loguru setup
+|       |-- rotation.py       # RotationDetector, AutoRotate
+|       |-- crop.py           # ContentCropper
+|       `-- core/
+|           `-- types.py      # RotationAngle, RotationResult
 |
-|-- src/vision/               # Image preprocessing utilities
-|   |-- __init__.py
-|   |-- rotation.py           # RotationDetector, AutoRotate
-|   |-- crop.py               # ContentCropper
-|   `-- core/
-|       `-- types.py          # RotationAngle, RotationResult
+|-- docs/
+|   |-- SYSTEM_DESIGN.md      # Architecture and design decisions
+|   |-- DEVELOPER_GUIDE.md    # Detailed development guide
+|   |-- DEPLOYMENT_CHECKLIST.md
+|   |-- TESTING_GUIDE.md
 |
 |-- deploy.py                 # Modal deploy entry point
+|-- generated_secret.py       # CLI tool for API key generation
 |-- pyproject.toml
 |-- .env.example
+|-- FINAL_STATUS_REPORT.md    # Project completion status
 `-- README.md
 ```
 
@@ -186,11 +213,21 @@ Follow the browser prompt to link your Modal account.
 
 ## Configuration
 
-### Generate API Key
+### Generate Per-Client API Keys
+
+Generate API keys for each client/environment:
 
 ```bash
-uv run generated_secret.py
+uv run generated_secret.py --environment prod
 ```
+
+Output:
+```
+Raw Key (give to client):    dp_prod_xK9mN2pQrStUvWxYzAbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGhIjKlMnOp
+SHA256 Hash (store on server): abc123def456789...
+```
+
+The **raw key** is what clients use in their requests. The **hash** is stored on the server.
 
 ### Environment Variables
 
@@ -200,34 +237,48 @@ Copy the example file:
 cp .env.example .env
 ```
 
+**Authentication (choose one):**
+
 | Variable | Required | Description |
 |---|---|---|
-| `X_API_KEY` | Yes | Master API key for all endpoints |
-| `OPENAI_BASE_URL` | Yes | LLM API base URL for figure description, e.g. `https://api.groq.com/openai/v1` |
-| `OPENAI_API_KEY` | Yes | LLM API key |
-| `OPENAI_MODEL_ID` | Yes | Vision LM model ID. |
+| `X_API_KEY_HASH` | Yes (recommended) | SHA256 hashes of per-client keys (comma or newline-separated) |
+| `X_API_KEY` | Optional (legacy) | Legacy single global API key (deprecated) |
+
+**LLM Configuration:**
+
+| Variable | Required | Description |
+|---|---|---|
+| `OPENAI_BASE_URL` | Yes | LLM API base URL, e.g. `https://api.groq.com/openai/v1` |
+| `OPENAI_API_KEY` | Yes | LLM API key for figure description |
+| `OPENAI_MODEL_ID` | Yes | Vision LM model ID |
 
 ### Modal Secret
 
 All environment variables must be stored as a Modal Secret named `parser-secret`:
 
 ```bash
+# Generate a production key first
+uv run generated_secret.py --environment prod
+
+# Create Modal secret with the SHA256 hash
 uv run modal secret create parser-secret \
-  X_API_KEY=sk-your-key-here \
-  OPENAI_BASE_URL=https://api.groq.com/openai/v1 \
-  OPENAI_API_KEY=sk-your-key-here \
-  OPENAI_MODEL_ID=meta-llama/llama-4-scout-17b-16e-instruct
+  X_API_KEY_HASH='abc123def456...,xyz789uvw012...' \
+  OPENAI_BASE_URL='https://api.groq.com/openai/v1' \
+  OPENAI_API_KEY='gsk_your_api_key' \
+  OPENAI_MODEL_ID='meta-llama/llama-4-scout-17b-16e-instruct'
 ```
 
 To update an existing secret:
 
 ```bash
 uv run modal secret create parser-secret --force \
-  X_API_KEY=sk-new-key \
-  OPENAI_BASE_URL=https://api.groq.com/openai/v1 \
-  OPENAI_API_KEY=sk-new-key \
-  OPENAI_MODEL_ID=meta-llama/llama-4-scout-17b-16e-instruct
+  X_API_KEY_HASH='new_hash_here' \
+  OPENAI_BASE_URL='https://api.groq.com/openai/v1' \
+  OPENAI_API_KEY='new_api_key' \
+  OPENAI_MODEL_ID='meta-llama/llama-4-scout-17b-16e-instruct'
 ```
+
+**Note:** For multiple clients, add their hashes separated by commas or newlines in `X_API_KEY_HASH`.
 
 ---
 
@@ -244,7 +295,7 @@ uv run modal serve deploy.py
 This will print a temporary URL such as:
 
 ```
-https://your-username--annual-report-parser-web-dev.modal.run
+https://your-username--api-document-parsing-web-dev.modal.run
 ```
 
 Use this URL for testing during development. The URL is only active while `modal serve` is running.
@@ -260,8 +311,8 @@ curl https://<your-serve-url>/health
 Parse a PDF (pages 1 to 5, with custom metadata):
 
 ```bash
-curl -X POST https://<your-serve-url>/parse/pdf \
-  -H "X-API-Key: sk-your-key" \
+curl -X POST https://<your-serve-url>/v1/parse/pdf \
+  -H "X-API-Key: dp_prod_xK9mN2..." \
   -F "file=@./sample.pdf" \
   -F 'metadata={"company":"PT Antam","year":2024,"label":"annual-report"}' \
   -F "start_page=1" \
@@ -271,42 +322,63 @@ curl -X POST https://<your-serve-url>/parse/pdf \
 Parse with no metadata (all fields optional):
 
 ```bash
-curl -X POST https://<your-serve-url>/parse/pdf \
-  -H "X-API-Key: sk-your-key" \
+curl -X POST https://<your-serve-url>/v1/parse/pdf \
+  -H "X-API-Key: dp_prod_xK9mN2..." \
   -F "file=@./sample.pdf"
+```
+
+Response (202 Accepted, job submitted):
+
+```json
+{
+  "job_id": "fc-01KKWGK5XF08SGJQKVXD0DBQ3M",
+  "status": "submitted",
+  "message": "Job submitted. Poll /v1/jobs/{job_id}/status for results."
+}
 ```
 
 Parse a single image (returns result immediately, no polling):
 
 ```bash
-curl -X POST https://<your-serve-url>/parse/image \
-  -H "X-API-Key: sk-your-key" \
+curl -X POST https://<your-serve-url>/v1/parse/image \
+  -H "X-API-Key: dp_prod_xK9mN2..." \
   -F "file=@./invoice.jpg" \
   -F 'metadata={"doc_type":"invoice","year":2024}'
 ```
 
-The image response includes parsed elements directly — no job_id polling needed.
+Response (200 OK, immediate result):
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "done",
+  "page_count": 1,
+  "metadata": {...},
+  "full_content": "...",
+  "table_markdown": null
+}
+```
 
 Poll status (PDF only):
 
 ```bash
-curl https://<your-serve-url>/status/<job_id> \
-  -H "X-API-Key: sk-your-key"
+curl https://<your-serve-url>/v1/jobs/<job_id>/status \
+  -H "X-API-Key: dp_prod_xK9mN2..."
 ```
 
 Retrieve result (JSON):
 
 ```bash
-curl https://<your-serve-url>/result/<job_id> \
-  -H "X-API-Key: sk-your-key"
+curl https://<your-serve-url>/v1/jobs/<job_id>/result \
+  -H "X-API-Key: dp_prod_xK9mN2..."
 ```
 
 Download JSONL file:
 
 ```bash
-curl -O -J https://<your-serve-url>/download/<job_id> \
-  -H "X-API-Key: sk-your-key"
-# saves: sample_20260318_090455.jsonl
+curl -O -J https://<your-serve-url>/v1/jobs/<job_id>/download \
+  -H "X-API-Key: dp_prod_xK9mN2..."
+# saves: report_20260603_120000.jsonl
 ```
 
 ### Interactive API docs
@@ -316,6 +388,18 @@ Open in browser while `modal serve` is running:
 ```
 https://<your-serve-url>/docs
 ```
+
+### Structured Logging
+
+The API outputs structured JSON logs to stdout. Each log entry includes:
+- `timestamp`: ISO 8601 format
+- `level`: Log level (INFO, WARNING, ERROR, etc.)
+- `logger`: Source module
+- `message`: Log message
+- `request_id`: Unique ID for request tracing
+- `job_id`: Job ID if applicable (during parsing)
+
+This makes logs suitable for aggregation platforms like DataDog, Splunk, or similar.
 
 ---
 
@@ -330,7 +414,7 @@ uv run modal deploy deploy.py
 This registers the app permanently. The production URL format is:
 
 ```
-https://your-username--annual-report-parser-web.modal.run
+https://your-username--api-document-parsing-web.modal.run
 ```
 
 Unlike `serve`, the deployed app keeps running after the command exits.
@@ -346,13 +430,13 @@ uv run modal app list
 Stop a running app:
 
 ```bash
-uv run modal app stop annual-report-parser
+uv run modal app stop api-document-parsing
 ```
 
 View live logs from a deployed app:
 
 ```bash
-uv run modal app logs annual-report-parser
+uv run modal app logs api-document-parsing
 ```
 
 ### GPU configuration
@@ -368,7 +452,7 @@ To change GPU type, update the variable and redeploy.
 
 ### Modal Volume
 
-Parsed output files (JSONL) are stored in a Modal Volume named `parser-results`. Output filenames follow the pattern `{original_name}_{YYYYMMDD_HHMMSS}.jsonl`, e.g. `sample_20260318_090455.jsonl`.
+Parsed output files (JSONL) are stored in a Modal Volume named `parser-results`. Output filenames follow the pattern `{original_name}_{YYYYMMDD_HHMMSS}.jsonl`, e.g. `report_20260603_120000.jsonl`.
 
 To list all output files:
 
@@ -379,48 +463,50 @@ uv run modal volume ls parser-results
 To download a specific output file:
 
 ```bash
-uv run modal volume get parser-results sample_20260318_090455.jsonl ./local_output/
+uv run modal volume get parser-results report_20260603_120000.jsonl ./local_output/
 ```
 
 Or use the API directly:
 
 ```bash
-curl -O -J https://<your-serve-url>/download/<job_id> \
-  -H "X-API-Key: sk-your-key"
+curl -O -J https://<your-deploy-url>/v1/jobs/<job_id>/download \
+  -H "X-API-Key: dp_prod_..."
 ```
 
 ---
 
 ## API Reference
 
+**Base URL:** `https://<your-modal-app>/v1`
+
 All endpoints require the header:
 
 ```
-X-API-Key: <your-api-key>
+X-API-Key: <your-raw-api-key>
 ```
 
-### POST /parse/pdf
+### POST /v1/parse/pdf
 
-Parse a PDF annual report.
+Parse a PDF document asynchronously (returns immediately with job ID).
 
 **Form parameters:**
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `file` | file | Yes | — | PDF file (`.pdf`) |
-| `metadata` | string (JSON) | No | `{}` | Arbitrary key-value metadata as a JSON string, e.g. `{"company":"PT Antam","year":2024,"label":"annual-report"}` |
-| `start_page` | integer | No | `null` | Start page, 1-indexed inclusive |
-| `end_page` | integer | No | `null` | End page, 1-indexed inclusive |
+| `metadata` | string (JSON) | No | `{}` | Arbitrary key-value metadata, e.g. `{"company":"PT Antam","year":2024,"label":"annual-report"}` |
+| `start_page` | integer | No | `null` | Start page (1-indexed, inclusive) |
+| `end_page` | integer | No | `null` | End page (1-indexed, inclusive) |
 | `enable_rotate` | boolean | No | `false` | Auto-detect and correct page rotation |
 | `enable_crop` | boolean | No | `false` | Auto-crop whitespace margins |
 
-**Response 202:**
+**Response 202 — job submitted:**
 
 ```json
 {
   "job_id": "fc-01KKWGK5XF08SGJQKVXD0DBQ3M",
   "status": "submitted",
-  "message": "PDF parsing started. Poll GET /status/fc-01..."
+  "message": "Job submitted. Poll /v1/jobs/{job_id}/status for results."
 }
 ```
 
@@ -435,18 +521,16 @@ Parse a PDF annual report.
 
 ---
 
-### POST /parse/image
+### POST /v1/parse/image
 
-Parse a single image file (JPG, PNG, TIFF, BMP) and return results immediately.
-
-Unlike `/parse/pdf` which uses background jobs, single images are parsed synchronously with no polling required.
+Parse a single image file synchronously (returns results immediately, no polling).
 
 **Form parameters:**
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `file` | file | Yes | — | Image file (`.jpg`, `.jpeg`, `.png`, `.tiff`, `.bmp`) |
-| `metadata` | string (JSON) | No | `{}` | Arbitrary key-value metadata as a JSON string |
+| `file` | file | Yes | — | Image file (`.jpg`, `.jpeg`, `.png`, `.webp`) |
+| `metadata` | string (JSON) | No | `{}` | Arbitrary key-value metadata |
 | `enable_rotate` | boolean | No | `false` | Auto-detect and correct image rotation |
 | `enable_crop` | boolean | No | `false` | Auto-crop whitespace margins |
 
@@ -454,40 +538,30 @@ Unlike `/parse/pdf` which uses background jobs, single images are parsed synchro
 
 ```json
 {
-  "job_id": "tracking-uuid",
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
   "status": "done",
-  "element_count": 45,
-  "elements": [
-    {
-      "id": "a3f8d2c1e4b7...64-char-sha256-hex",
-      "element_type": "text",
-      "label": "paragraph",
-      "content": "Extracted text from image...",
-      "table_markdown": null,
-      "full_content": "...",
-      "metadata": { ... }
-    },
-    ...
-  ]
+  "page_count": 1,
+  "metadata": {
+    "filename": "receipt.jpg",
+    "extension": ".jpg",
+    "duration_seconds": 3.21,
+    "extra_fields": {
+      "company": "Acme",
+      "year": 2024
+    }
+  },
+  "full_content": "East Repair Inc.\n\nItem 1...",
+  "table_markdown": "| Item | Price |\n|---|---|\n| A | 10 |"
 }
 ```
 
-No polling needed — results are available in the same request.
+No polling needed — results are available immediately.
 
 ---
 
-### GET /status/{job_id}
+### GET /v1/jobs/{job_id}/status
 
-Poll the status of a submitted job.
-
-**Response 202 — still processing:**
-
-```json
-{
-  "job_id": "fc-01KKWGK5XF08SGJQKVXD0DBQ3M",
-  "status": "processing"
-}
-```
+Poll the current status of a submitted PDF job.
 
 **Response 200 — done:**
 
@@ -496,25 +570,36 @@ Poll the status of a submitted job.
   "job_id": "fc-01KKWGK5XF08SGJQKVXD0DBQ3M",
   "status": "done",
   "element_count": 342,
-  "output_path": "sample_20260318_090455.jsonl"
+  "output_path": "report_20260603_120000.jsonl"
 }
 ```
 
-**Response 404 — expired:**
+**Response 200 — still processing (with 202 in practice):**
 
 ```json
 {
-  "job_id": "fc-01...",
-  "status": "expired",
-  "error": "Job not found or expired (>7 days)"
+  "job_id": "fc-01KKWGK5XF08SGJQKVXD0DBQ3M",
+  "status": "processing"
+}
+```
+
+**Response 404 — expired or not found:**
+
+```json
+{
+  "error": {
+    "code": "JOB_NOT_FOUND",
+    "message": "Job not found or expired (>7 days)",
+    "request_id": "req_abc123"
+  }
 }
 ```
 
 ---
 
-### GET /result/{job_id}
+### GET /v1/jobs/{job_id}/result
 
-Retrieve the full parsed element list. Only call after `/status` returns `done`.
+Retrieve the full parsed PDF result with all pages and elements. Only call after `/status` returns `done`.
 
 **Response 200:**
 
@@ -522,8 +607,24 @@ Retrieve the full parsed element list. Only call after `/status` returns `done`.
 {
   "job_id": "fc-01...",
   "status": "done",
-  "element_count": 342,
-  "elements": [ ... ]
+  "page_count": 50,
+  "metadata": {
+    "filename": "report.pdf",
+    "extension": ".pdf",
+    "duration_seconds": 154.2,
+    "page_range": {"start": 1, "end": 50},
+    "extra_fields": {
+      "company": "Acme",
+      "year": 2024
+    }
+  },
+  "full_content": [
+    {"page": 1, "content": "..."},
+    {"page": 2, "content": "..."}
+  ],
+  "table_markdown": [
+    {"page": 3, "content": "| col | col |..."}
+  ]
 }
 ```
 
@@ -531,25 +632,27 @@ Retrieve the full parsed element list. Only call after `/status` returns `done`.
 
 ---
 
-### GET /download/{job_id}
+### GET /v1/jobs/{job_id}/download
 
-Download the generated JSONL output file for a completed job. The file is streamed directly from the Modal results volume.
-
-> **Note:** Returns 202 if the job is still processing, 404 if the file is not found or the job has expired.
+Download the generated JSONL output file for a completed job.
 
 **Response 200 — JSONL file download:**
 
 ```bash
-curl -O -J https://<your-serve-url>/download/fc-01KKWGK5XF08SGJQKVXD0DBQ3M \
-  -H "X-API-Key: sk-your-key"
-# saves: sample_20260318_090455.jsonl
+curl -O -J https://<your-modal-app>/v1/jobs/fc-01KKWGK5XF08SGJQKVXD0DBQ3M/download \
+  -H "X-API-Key: dp_prod_..."
+# saves: report_20260603_120000.jsonl
 ```
+
+**Response 202:** Job still processing.
+
+**Response 404:** Job not found or expired.
 
 ---
 
 ### GET /health
 
-Returns service health. No authentication required.
+Liveness check (no authentication required).
 
 ```json
 { "status": "ok" }
@@ -559,58 +662,254 @@ Returns service health. No authentication required.
 
 ## Output Schema
 
-Each element in the `elements` array follows this structure:
+### PDF Parse Result
 
 ```json
 {
-  "id": "a3f8d2c1e4b7...64-char-sha256-hex",
-  "element_type": "text",
-  "label": "paragraph",
-  "content": "Laporan Posisi Keuangan Konsolidasian...",
-  "table_markdown": null,
-  "full_content": "Full aggregated text of all elements on this page...",
+  "job_id": "fc-01KKWGK5XF08SGJQKVXD0DBQ3M",
+  "status": "done",
+  "page_count": 50,
   "metadata": {
-    "source": "sample.pdf",
-    "doc_ref": "#/texts/2",
-    "page": 5,
-    "pages": [5],
-    "bbox": {
-      "l": 56.7,
-      "t": 112.3,
-      "r": 540.1,
-      "b": 145.8
-    },
-    "company": "PT Antam",
-    "year": 2024,
-    "label": "annual-report"
+    "filename": "report.pdf",
+    "extension": ".pdf",
+    "duration_seconds": 154.2,
+    "page_range": {"start": 1, "end": 50},
+    "extra_fields": {
+      "company": "PT Antam",
+      "year": 2024,
+      "label": "annual-report"
+    }
+  },
+  "full_content": [
+    {"page": 1, "content": "Page 1 text..."},
+    {"page": 2, "content": "Page 2 text..."}
+  ],
+  "table_markdown": [
+    {"page": 3, "content": "| col1 | col2 |\n|---|---|\n| val1 | val2 |"}
+  ]
+}
+```
+
+### Image Parse Result
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "done",
+  "page_count": 1,
+  "metadata": {
+    "filename": "invoice.jpg",
+    "extension": ".jpg",
+    "duration_seconds": 3.21,
+    "extra_fields": {
+      "doc_type": "invoice",
+      "year": 2024
+    }
+  },
+  "full_content": "Invoice text content...",
+  "table_markdown": "| Item | Amount |\n|---|---|\n| Service | $100 |"
+}
+```
+
+### Response Headers
+
+All successful responses include:
+
+```
+X-Request-ID: req_550e8400-e29b-41d4-a716-446655440000
+Content-Type: application/json
+```
+
+The `X-Request-ID` header can be used for tracing logs and debugging.
+
+### Metadata Fields
+
+**Fixed fields** (always present):
+- `filename`: Original uploaded filename
+- `extension`: File extension (e.g., `.pdf`, `.jpg`)
+- `duration_seconds`: Parsing duration in seconds (rounded to 2 decimals)
+- `page_range` (PDF only): `{"start": 1, "end": 50}` — pages that were parsed
+- `extra_fields`: User-supplied metadata from the `metadata` form parameter
+
+**extra_fields**
+
+The `extra_fields` object contains all key-value pairs from the `metadata` form parameter passed at submission time. For example:
+
+```bash
+curl -X POST https://<url>/v1/parse/pdf \
+  -H "X-API-Key: dp_prod_..." \
+  -F "file=@report.pdf" \
+  -F 'metadata={"company":"Acme","year":2024,"label":"Q1-2024"}'
+```
+
+Results in:
+
+```json
+{
+  "metadata": {
+    "filename": "report.pdf",
+    "extension": ".pdf",
+    "duration_seconds": 120.5,
+    "extra_fields": {
+      "company": "Acme",
+      "year": 2024,
+      "label": "Q1-2024"
+    }
   }
 }
 ```
 
-### Element types
+### JSONL File Format
 
-| element_type | Description |
+Each line in the downloaded JSONL file represents one parsed element:
+
+```json
+{"id": "a3f8d2c1e4b7...", "element_type": "text", "label": "paragraph", "content": "...", "metadata": {...}}
+{"id": "b4f9e3d2f5c8...", "element_type": "table", "label": "table", "content": "...", "metadata": {...}}
+```
+
+Each element has:
+- `id`: SHA-256 deterministic ID (same document = same ID)
+- `element_type`: `text`, `heading`, `table`, or `figure`
+- `label`: Specific element label (e.g., `paragraph`, `title`)
+- `content`: Extracted text or Markdown
+- `metadata`: Document, page, and user-supplied metadata
+
+---
+
+## Documentation
+
+For detailed information about the project, refer to these comprehensive guides:
+
+| Document | Purpose |
 |---|---|
-| `text` | Regular paragraph, caption, footnote |
-| `heading` | Section header detected by layout model |
-| `table` | Extracted table. `content` and `table_markdown` contain Markdown |
-| `figure` | Image or chart. `content` contains LLM-generated description |
+| `docs/SYSTEM_DESIGN.md` | Architecture, API design, folder structure, versioning strategy |
+| `docs/DEVELOPER_GUIDE.md` | Quick start, key generation, structured logging, debugging |
+| `docs/DEPLOYMENT_CHECKLIST.md` | Step-by-step deployment to production |
 
-### id field
+---
 
-Each element has a deterministic `id` — a SHA-256 hex digest computed from `source + doc_ref + element_type + content`. The same document and content always produce the same `id`, making elements safe to deduplicate or cross-reference across runs.
+## Authentication Setup (Per-Client Keys)
 
-### metadata field
+The API uses per-client API keys instead of a shared master key. This allows you to:
 
-The `metadata` object always contains `source`, `doc_ref`, `page`, `pages`, and `bbox`. All additional fields (e.g. `company`, `year`, `label`, `type`) come directly from the `metadata` JSON string submitted at request time — there are no hardcoded fields. Any keys the caller passes will be stored on every element.
+- Revoke access for individual clients without affecting others
+- Track usage per client
+- Rotate keys independently
 
-### full_content field
+### How it works
 
-`full_content` contains all element content from the same page concatenated with double newlines. This field is identical across all elements on the same page. It is intended for use cases where full-page context is needed alongside individual element retrieval.
+1. **Generate a key** for each client:
+   ```bash
+   uv run generated_secret.py --environment prod
+   ```
+   Output:
+   ```
+   Raw Key:  dp_prod_xK9mN2pQrStUvWxYzAbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGhIjKlMnOp
+   Hash:     abc123def456789...
+   ```
+
+2. **Give the raw key** to the client (e.g., FE team)
+
+3. **Store the hash** on the server in `X_API_KEY_HASH` env var
+
+4. When clients make requests, they send the raw key in the `X-API-Key` header
+
+5. The server hashes the incoming key and compares it against stored hashes (timing-safe comparison)
+
+### Multiple clients
+
+To support multiple clients, separate their hashes with commas or newlines:
+
+```bash
+uv run modal secret create parser-secret --force \
+  X_API_KEY_HASH='hash1_here,hash2_here,hash3_here' \
+  OPENAI_BASE_URL='...' \
+  OPENAI_API_KEY='...' \
+  OPENAI_MODEL_ID='...'
+```
+
+Each client uses their own raw key, and the server validates against the list of hashes.
 
 ---
 
 ## Troubleshooting
+
+### 401 Unauthorized — Invalid API Key
+
+**Error:** `{"error": {"code": "AUTH_FAILED", "message": "Invalid API key"}}`
+
+**Solution:**
+
+1. Verify you're using the **raw key**, not the hash
+2. Verify the header name is `X-API-Key` (case-sensitive)
+3. Verify the key matches one of the hashes stored in `X_API_KEY_HASH`
+4. Regenerate a key if needed: `uv run generated_secret.py --environment prod`
+
+---
+
+### 422 Validation Error — Invalid metadata JSON
+
+**Error:** `{"error": {"code": "VALIDATION_ERROR", "message": "metadata must be valid JSON"}}`
+
+**Solution:**
+
+Ensure the `metadata` form parameter is valid JSON:
+
+```bash
+# ❌ Wrong — single quotes, unquoted keys
+-F 'metadata={'company':'Acme'}'
+
+# ✅ Correct — double quotes, proper JSON
+-F 'metadata={"company":"Acme"}'
+```
+
+---
+
+### 422 Validation Error — start_page > end_page
+
+**Error:** `start_page must be <= end_page`
+
+**Solution:**
+
+Ensure `start_page` is less than or equal to `end_page`. Leave both empty to parse the entire document.
+
+---
+
+### Job returns 500 after status shows done
+
+**Symptom:** `/v1/jobs/{job_id}/status` returns `done`, but `/v1/jobs/{job_id}/result` returns 500 error
+
+**Reason:** The GPU function raised an exception during parsing. Check the container logs:
+
+```bash
+uv run modal app logs api-document-parsing
+```
+
+Look for the traceback associated with the job's function call ID.
+
+---
+
+### Modal serve times out — request takes too long
+
+**Reason:** Modal requests have a default timeout of ~120 seconds. PDFs with 500+ pages may exceed this.
+
+**Solution:** 
+
+For large documents, use the async job submission (`POST /v1/parse/pdf` returns 202 immediately). Then poll for results:
+
+```bash
+# Submit job (returns immediately with job_id)
+curl -X POST https://<url>/v1/parse/pdf \
+  -H "X-API-Key: dp_prod_..." \
+  -F "file=@huge_document.pdf"
+
+# Poll until done
+curl https://<url>/v1/jobs/<job_id>/status \
+  -H "X-API-Key: dp_prod_..."
+```
+
+---
 
 ### ModuleNotMountable: vision has no spec
 
@@ -666,18 +965,6 @@ Blocking Modal interfaces used inside async FastAPI handlers cause performance i
 
 ---
 
-### Job returns 500 after status shows done
-
-This usually means the GPU function raised an exception that was caught and stored by Modal. Check the container logs:
-
-```bash
-modal app logs annual-report-parser
-```
-
-Look for the traceback associated with the `fc-` function call ID.
-
----
-
 ## Performance Notes
 
 ### Reducing cold start time
@@ -695,6 +982,8 @@ model_volume = modal.Volume.from_name("docling-models", create_if_missing=True)
 )
 ```
 
+The `scaledown_window=900` (15 minutes) keeps the container warm for follow-up requests.
+
 ### Batch processing multiple documents
 
 Submit all jobs first, then poll. Do not wait for each job to complete before submitting the next:
@@ -702,13 +991,13 @@ Submit all jobs first, then poll. Do not wait for each job to complete before su
 ```python
 job_ids = []
 for pdf_path in pdf_list:
-    response = requests.post("/parse/pdf", ...)
+    response = requests.post("https://<url>/v1/parse/pdf", ...)
     job_ids.append(response.json()["job_id"])
 
 # Poll all jobs concurrently
 for job_id in job_ids:
     while True:
-        status = requests.get(f"/status/{job_id}", ...).json()
+        status = requests.get(f"https://<url>/v1/jobs/{job_id}/status", ...).json()
         if status["status"] == "done":
             break
         time.sleep(10)
@@ -717,3 +1006,7 @@ for job_id in job_ids:
 ### Page range for large documents
 
 For annual reports with 200+ pages, always use `start_page` and `end_page` to limit parsing to relevant sections. Financial statements are typically found in the final 30 to 50 percent of the document.
+
+### Polling intervals
+
+Recommended polling interval: **10-30 seconds**. Polling too frequently wastes API calls; polling too infrequently increases perceived latency.

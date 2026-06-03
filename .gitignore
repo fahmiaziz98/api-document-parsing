@@ -3,7 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-docs/
+# docs/
+PROJECT_COMPLETION_SUMMARY.md
+PHASE_4_SUMMARY.md
+PHASE_4_COMPLETION.md
+FINAL_STATUS_REPORT.md
+CLIENT_MIGRATION_GUIDE.md
+TESTING_GUIDE.md
 
 # C extensions
 *.so

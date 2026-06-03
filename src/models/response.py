@@ -1,25 +1,8 @@
-from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
-
-class JobStatusEnum(StrEnum):
-    """Enumeration of possible job parsing statuses."""
-
-    SUBMITTED = "submitted"
-    PROCESSING = "processing"
-    DONE = "done"
-    ERROR = "error"
-    EXPIRED = "expired"
-
-
-class ElementTypeEnum(StrEnum):
-    """Enumeration of possible element types in a parsed document — used internally by exporter."""
-
-    TEXT = "text"
-    HEADING = "heading"
-    TABLE = "table"
-    FIGURE = "figure"
+from src.models.enums import ErrorCodeEnum, JobStatusEnum
 
 
 class JobSubmitted(BaseModel):
@@ -30,7 +13,7 @@ class JobSubmitted(BaseModel):
         default=JobStatusEnum.SUBMITTED, description="Current status of the job."
     )
     message: str = Field(
-        default="Job submitted. Poll /status/{job_id} for results.",
+        default="Job submitted. Poll /v1/jobs/{job_id}/status for results.",
         description="Helper message for next steps.",
     )
 
@@ -67,6 +50,9 @@ class ImageMetadata(BaseModel):
     filename: str = Field(..., description="Original uploaded filename.")
     extension: str = Field(..., description="File extension, e.g. '.jpg'.")
     duration_seconds: float = Field(..., description="Parsing duration in seconds.")
+    extra_fields: dict[str, Any] = Field(
+        default_factory=dict, description="User-supplied metadata (e.g. company, year, etc.)"
+    )
 
 
 class PdfMetadata(BaseModel):
@@ -77,6 +63,9 @@ class PdfMetadata(BaseModel):
     duration_seconds: float = Field(..., description="Parsing duration in seconds.")
     page_range: dict[str, int] = Field(
         ..., description="Parsed page range, e.g. {'start': 1, 'end': 10}."
+    )
+    extra_fields: dict[str, Any] = Field(
+        default_factory=dict, description="User-supplied metadata (e.g. company, year, etc.)"
     )
 
 
@@ -122,3 +111,18 @@ class PdfParseResult(BaseModel):
         default_factory=list,
         description="Markdown tables per page. Empty list if no tables found.",
     )
+
+
+class ErrorDetail(BaseModel):
+    """Unified error response format."""
+
+    code: ErrorCodeEnum = Field(..., description="Machine-readable error code.")
+    message: str = Field(..., description="Human-readable error message.")
+    details: dict[str, Any] = Field(default_factory=dict, description="Additional error context.")
+    request_id: str = Field(..., description="Request ID for tracing.")
+
+
+class ErrorResponse(BaseModel):
+    """Top-level error response wrapper."""
+
+    error: ErrorDetail = Field(..., description="Error details.")

@@ -4,7 +4,7 @@ from collections import defaultdict
 from docling_core.types.doc.labels import DocItemLabel
 from loguru import logger
 
-from src.models.response import ElementTypeEnum
+from src.models.enums import ElementTypeEnum
 
 
 def _make_element_id(source: str, doc_ref: str, element_type: str, content: str) -> str:

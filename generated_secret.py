@@ -1,65 +1,63 @@
+#!/usr/bin/env python3
+"""
+CLI tool to generate per-client API keys for the Document Parsing API.
+
+Usage:
+    python generated_secret.py --environment prod
+    python generated_secret.py --environment dev
+    python generated_secret.py --environment staging
+
+The tool outputs:
+    - Raw key: Give this to the client (only shown once)
+    - Hash: Store this in X_API_KEY_HASH environment variable
+"""
+
 import argparse
-import secrets
-import string
+import sys
+from pathlib import Path
 
+# Add src to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
 
-def generate_secret_key(length: int = 64) -> str:
-    """
-    Generate a cryptographically secure secret key.
-    
-    Args:
-        length (int): Length of the secret key to generate.
-        
-    Returns:
-        str: Generated secure secret key string.
-    """
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def validate_secret_key(key: str, expected: str) -> bool:
-    """
-    Securely validate a given key against an expected key 
-    using constant-time comparison to mitigate timing attacks.
-    
-    Args:
-        key (str): The key provided by the user/request.
-        expected (str): The expected correct key.
-        
-    Returns:
-        bool: True if they match, False otherwise.
-    """
-    if not key or not expected:
-        return False
-    return secrets.compare_digest(key, expected)
+from src.utils.key_gen import generate_api_key
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate and validate API secret keys.")
-    parser.add_argument("--generate", action="store_true", help="Generate a new secret key")
-    parser.add_argument("--length", type=int, default=64, help="Length of the generated key")
-    parser.add_argument("--validate", type=str, help="Key to validate")
-    parser.add_argument("--expected", type=str, help="Expected key to validate against")
+    """Generate and display a new API key with its hash."""
+    parser = argparse.ArgumentParser(
+        description="Generate per-client API key for Document Parsing API"
+    )
+    parser.add_argument(
+        "--environment",
+        "-e",
+        default="prod",
+        choices=["prod", "dev", "staging"],
+        help="Environment prefix (default: prod)",
+    )
 
     args = parser.parse_args()
 
-    if args.generate or (not args.validate and not args.generate):
-        new_key = generate_secret_key(args.length)
-        print("Generated Secure API Key:")
-        print("-" * 50)
-        print(new_key)
-        print("-" * 50)
-        print("\nMake sure to add this to your .env file as API_KEY:")
-        print(f"API_KEY={new_key}")
-        
-    elif args.validate and args.expected:
-        is_valid = validate_secret_key(args.validate, args.expected)
-        if is_valid:
-            print("✅ Key is valid! (Matches expected key securely)")
-        else:
-            print("❌ Invalid key! (Does not match expected key)")
-    elif args.validate and not args.expected:
-        print("Error: Must provide --expected key when using --validate")
+    # Generate key and hash
+    raw_key, key_hash = generate_api_key(environment=args.environment)
+
+    # Display results
+    print("\n" + "=" * 80)
+    print("API KEY GENERATED")
+    print("=" * 80)
+    print(f"\nEnvironment: {args.environment}")
+    print("\nRaw Key (give to client, shown only once):")
+    print(f"  {raw_key}")
+    print("\nHash (store in X_API_KEY_HASH env var):")
+    print(f"  {key_hash}")
+    print("\n" + "=" * 80)
+    print("\nSetup instructions:")
+    print("  1. Give the raw key to your client")
+    print("  2. Store the hash in your .env file:")
+    print(f"     X_API_KEY_HASH={key_hash}")
+    print("  3. If you have multiple keys, separate them with commas:")
+    print("     X_API_KEY_HASH=hash1,hash2,hash3")
+    print("\n")
+
 
 if __name__ == "__main__":
     main()

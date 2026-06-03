@@ -1,7 +1,7 @@
 import json
 import tempfile
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import fitz
@@ -62,7 +62,9 @@ class DocumentParser:
 
     @modal.enter()
     def load(self):
-        from src.core.parser import build_image_converter, build_pdf_converter
+        """Loads the PDF and image converters and sets up logging."""
+
+        from src.api.core.parser import build_image_converter, build_pdf_converter
         from src.utils.logging import setup_logging
 
         setup_logging()
@@ -96,7 +98,7 @@ class DocumentParser:
         Returns:
             dict: Result payload with status, element_count, output_path, and elements.
         """
-        from src.core.exporter import export_raw_elements
+        from src.api.core.exporter import export_raw_elements
         from src.models.response import JobStatusEnum
 
         elements = export_raw_elements(doc, metadata, filename)
@@ -137,10 +139,14 @@ class DocumentParser:
         Returns:
             dict: Job status, elements, and metadata for building PdfParseResult
         """
-        from src.core.preprocess import preprocess_pdf
+        from datetime import datetime
+
+        from src.api.core.preprocess import preprocess_pdf
         from src.models.response import JobStatusEnum
+        from src.services.job_store import save_job_metadata
 
         t_start = time.monotonic()
+        submitted_at = datetime.now(UTC).isoformat()
 
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -176,13 +182,15 @@ class DocumentParser:
 
                 convert_kwargs = dict(source=str(input_path), raises_on_error=False)
                 if page_range is not None:
-                    convert_kwargs["page_range"] = page_range
+                    convert_kwargs["page_range"] = page_range  # type: ignore
 
                 result = self.pdf_converter.convert(**convert_kwargs)
                 parsed = self._finish_parse(result.document, metadata, filename)
 
                 duration = time.monotonic() - t_start
-                return {
+                completed_at = datetime.now(UTC).isoformat()
+
+                result_dict = {
                     **parsed,
                     "filename": filename,
                     "duration_seconds": round(duration, 2),
@@ -191,6 +199,27 @@ class DocumentParser:
                     "start_page": resolved_start,
                     "end_page": resolved_end,
                 }
+
+                # Save job metadata to Modal Volume for persistence beyond 7 days
+                try:
+                    save_job_metadata(
+                        job_id=str(result_dict.get("job_id", "unknown")),
+                        filename=filename,
+                        extension=Path(filename).suffix.lower(),
+                        submitted_at=submitted_at,
+                        completed_at=completed_at,
+                        duration_seconds=result_dict["duration_seconds"],
+                        total_pages=total_pages,
+                        start_page=resolved_start,
+                        end_page=resolved_end,
+                        element_count=result_dict["element_count"],
+                        output_path=result_dict["output_path"],
+                        user_metadata=metadata,
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save job metadata: {e}", exc_info=True)
+
+                return result_dict
 
         except Exception as e:
             logger.error("parse_pdf failed", exc_info=True)
@@ -218,7 +247,7 @@ class DocumentParser:
         Returns:
             dict: Job status and elements
         """
-        from src.core.preprocess import preprocess_image
+        from src.api.core.preprocess import preprocess_image
         from src.models.response import JobStatusEnum
 
         try:

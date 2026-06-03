@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
@@ -11,11 +12,13 @@ from loguru import logger
 
 from src.modal_app import results_volume
 from src.models.response import (
+    ImageMetadata,
     ImageParseResult,
     JobStatusEnum,
     JobSubmitted,
     PageContent,
     PageTableMarkdown,
+    PdfMetadata,
     PdfParseResult,
 )
 from src.utils.auth import verify_api_key
@@ -50,54 +53,73 @@ async def _get_call_result(job_id: str, timeout: int = 0):
     return await fc.get.aio(timeout=timeout)
 
 
-def _build_image_result(job_id: str, elements: list[dict]) -> ImageParseResult:
+def _build_image_result(
+    job_id: str,
+    elements: list[dict],
+    filename: str,
+    duration_seconds: float,
+    user_metadata: dict,
+) -> ImageParseResult:
     """
     Transform raw element list from exporter into a flat ImageParseResult.
-
-    Images are always single-page, so we concat all full_content into one
-    string and pick the first table_markdown found (if any).
 
     Args:
         job_id: UUID for this parse job.
         elements: Raw element dicts from export_raw_elements.
+        filename: Original uploaded filename.
+        duration_seconds: Parsing duration in seconds.
+        user_metadata: User-supplied metadata (company, year, etc).
 
     Returns:
         ImageParseResult: Flat response model.
     """
-    # full_content is the same for all elements on the same page — grab first non-empty
     full_content = next(
         (el.get("full_content") for el in elements if el.get("full_content")),
         None,
     )
-
-    # Pick first table_markdown found (image is single-page, at most one table block)
     table_markdown = next(
         (el.get("table_markdown") for el in elements if el.get("table_markdown")),
         None,
     )
+    ext = Path(filename).suffix.lower()
 
     return ImageParseResult(
         job_id=job_id,
         status=JobStatusEnum.DONE,
         page_count=1,
+        metadata=ImageMetadata(
+            filename=filename,
+            extension=ext,
+            duration_seconds=round(duration_seconds, 2),
+            **user_metadata,
+        ),
         full_content=full_content,
         table_markdown=table_markdown,
     )
 
 
-def _build_pdf_result(job_id: str, elements: list[dict]) -> PdfParseResult:
+def _build_pdf_result(
+    job_id: str,
+    elements: list[dict],
+    filename: str,
+    duration_seconds: float,
+    user_metadata: dict,
+    total_pages: int,
+    start_page: int | None,
+    end_page: int | None,
+) -> PdfParseResult:
     """
     Transform raw element list from exporter into a per-page PdfParseResult.
-
-    Groups elements by page number, then:
-    - full_content: one PageContent entry per page (deduplicated since all
-      elements on the same page share the same full_content string)
-    - table_markdown: one PageTableMarkdown entry per page that has a table,
-      concatenating multiple tables on the same page with a newline separator.
 
     Args:
         job_id: UUID for this parse job.
         elements: Raw element dicts from export_raw_elements.
+        filename: Original uploaded filename.
+        duration_seconds: Parsing duration in seconds.
+        user_metadata: User-supplied metadata (company, year, etc).
+        total_pages: Actual total pages from Modal worker.
+        start_page: User-requested start page (None = from beginning).
+        end_page: User-requested end page (None = to end).
 
     Returns:
         PdfParseResult: Per-page response model.
@@ -127,12 +149,23 @@ def _build_pdf_result(job_id: str, elements: list[dict]) -> PdfParseResult:
         for page, tables in sorted(tables_by_page.items())
     ]
 
-    page_count = max(seen_pages) if seen_pages else 0
+    page_count = total_pages or (max(seen_pages) if seen_pages else 0)
+    ext = Path(filename).suffix.lower()
 
     return PdfParseResult(
         job_id=job_id,
         status=JobStatusEnum.DONE,
         page_count=page_count,
+        metadata=PdfMetadata(
+            filename=filename,
+            extension=ext,
+            duration_seconds=round(duration_seconds, 2),
+            page_range={
+                "start": start_page or 1,
+                "end": end_page or total_pages,
+            },
+            **user_metadata,
+        ),
         full_content=full_content_pages,
         table_markdown=table_markdown_pages,
     )
@@ -140,12 +173,7 @@ def _build_pdf_result(job_id: str, elements: list[dict]) -> PdfParseResult:
 
 @web_app.get("/health")
 async def health():
-    """
-    Health check endpoint
-
-    Returns:
-        JSONResponse: JSON response with status
-    """
+    """Health check endpoint."""
     return {"status": "ok"}
 
 
@@ -165,22 +193,21 @@ async def parse_pdf_endpoint(
 ):
     """
     Submit a PDF file to the Modal parsing queue.
-    Checks authorization and validates file extensions before dispatching.
 
     Args:
-        file (UploadFile): File to parse
+        file (UploadFile): PDF file to parse
         metadata (str): JSON string of arbitrary key-value metadata
-            e.g. '{"company": "Acme", "year": 2024, "label": "annual-report"}'
-        start_page (str | None): Start page
-        end_page (str | None): End page
-        enable_rotate (bool): Enable rotation
-        enable_crop (bool): Enable crop
+            e.g. '{"company": "Acme", "year": 2024}'
+        start_page (str | None): Start page (1-indexed)
+        end_page (str | None): End page (1-indexed)
+        enable_rotate (bool): Enable auto-rotation
+        enable_crop (bool): Enable content cropping
 
     Returns:
         JobSubmitted: Job ID and polling instructions
 
     Raises:
-        HTTPException: If the file extension is not allowed or metadata is invalid JSON
+        HTTPException: If file validation or metadata is invalid
     """
     metadata_dict = _parse_metadata(metadata)
     _start = optional_int(start_page)
@@ -222,20 +249,15 @@ async def parse_image_endpoint(
     """
     Parse an image file directly and return results immediately.
 
-    Unlike PDF parsing which uses background jobs, single images are parsed
-    synchronously using .remote.aio() — no spawn/poll needed. This avoids
-    the overhead of FunctionCall tracking and is safe because the image
-    pipeline completes fast enough for a direct HTTP response.
-
     Args:
         file (UploadFile): Image file to parse
         metadata (str): JSON string of arbitrary key-value metadata
-            e.g. '{"company": "Acme", "year": 2024, "label": "invoice"}'
-        enable_rotate (bool): Enable rotation
-        enable_crop (bool): Enable crop
+            e.g. '{"company": "Acme", "year": 2024}'
+        enable_rotate (bool): Enable auto-rotation
+        enable_crop (bool): Enable content cropping
 
     Returns:
-        ImageParseResult: Flat content and optional table markdown
+        ImageParseResult: Flat content, table markdown, and metadata
 
     Raises:
         HTTPException: If file validation or parsing fails
@@ -247,6 +269,7 @@ async def parse_image_endpoint(
     from src.modal_app import DocumentParser
 
     try:
+        t_start = time.monotonic()
         result = await DocumentParser().parse_image.remote.aio(
             file_bytes,
             file.filename,
@@ -254,6 +277,7 @@ async def parse_image_endpoint(
             enable_rotate,
             enable_crop,
         )
+        duration = time.monotonic() - t_start
 
         status_val = result.get("status", JobStatusEnum.DONE)
         if status_val == JobStatusEnum.ERROR:
@@ -262,7 +286,13 @@ async def parse_image_endpoint(
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=error_msg)
 
         job_id = str(uuid.uuid4())
-        return _build_image_result(job_id, result.get("elements", []))
+        return _build_image_result(
+            job_id=job_id,
+            elements=result.get("elements", []),
+            filename=file.filename,
+            duration_seconds=duration,
+            user_metadata=metadata_dict,
+        )
 
     except HTTPException:
         raise
@@ -274,14 +304,14 @@ async def parse_image_endpoint(
 @web_app.get("/status/{job_id}", dependencies=[Depends(verify_api_key)])
 async def get_status(job_id: str):
     """
-    Poll the status of a submitted Modal job.
-    Returns processing, done, expired, or error depending on the underlying Modal run state.
+    Poll the status of a submitted PDF job.
+    Lightweight — returns job_id, status, output_path, error only.
 
     Args:
-        job_id (str): Job ID
+        job_id (str): Job ID from /parse/pdf
 
     Returns:
-        JSONResponse: Lightweight status — job_id, status, output_path, error only.
+        JSONResponse: Lightweight status response
     """
     try:
         result = await _get_call_result(job_id, timeout=0)
@@ -301,10 +331,7 @@ async def get_status(job_id: str):
     except TimeoutError:
         return JSONResponse(
             status_code=status.HTTP_202_ACCEPTED,
-            content={
-                "job_id": job_id,
-                "status": JobStatusEnum.PROCESSING,
-            },
+            content={"job_id": job_id, "status": JobStatusEnum.PROCESSING},
         )
     except modal.exception.NotFoundError:
         return JSONResponse(
@@ -319,11 +346,7 @@ async def get_status(job_id: str):
         logger.error(f"Status check failed for job {job_id}", exc_info=True)
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "job_id": job_id,
-                "status": JobStatusEnum.ERROR,
-                "error": str(e),
-            },
+            content={"job_id": job_id, "status": JobStatusEnum.ERROR, "error": str(e)},
         )
 
 
@@ -336,14 +359,14 @@ async def get_result(job_id: str):
     """
     Fetch the full parsed result for a finalized PDF job.
 
-    Returns PdfParseResult with per-page full_content and table_markdown.
+    Returns PdfParseResult with per-page full_content, table_markdown, and metadata.
     Still processing → 202. Error → 500. Not found → 404.
 
     Args:
-        job_id (str): Job ID from /parse/pdf response
+        job_id (str): Job ID from /parse/pdf
 
     Returns:
-        PdfParseResult: Per-page content and tables
+        PdfParseResult: Per-page content, tables, and metadata
     """
     try:
         result = await _get_call_result(job_id, timeout=0)
@@ -373,14 +396,19 @@ async def get_result(job_id: str):
     if status_val == JobStatusEnum.ERROR:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "job_id": job_id,
-                "status": JobStatusEnum.ERROR,
-                "error": result.get("error"),
-            },
+            content={"job_id": job_id, "status": JobStatusEnum.ERROR, "error": result.get("error")},
         )
 
-    return _build_pdf_result(job_id, result.get("elements", []))
+    return _build_pdf_result(
+        job_id=job_id,
+        elements=result.get("elements", []),
+        filename=result.get("filename", ""),
+        duration_seconds=result.get("duration_seconds", 0.0),
+        user_metadata=result.get("user_metadata", {}),
+        total_pages=result.get("total_pages", 0),
+        start_page=result.get("start_page"),
+        end_page=result.get("end_page"),
+    )
 
 
 @web_app.get(
@@ -390,19 +418,16 @@ async def get_result(job_id: str):
 )
 async def download_result(job_id: str):
     """
-    Download the parsed result for a completed PDF job as PdfParseResult.
+    Download the parsed result for a completed PDF job as a JSON file.
 
-    Reads the JSONL file from Modal Volume, transforms elements into
-    per-page PdfParseResult format, and returns as JSON response.
+    Reads the JSONL from Modal Volume, transforms to PdfParseResult,
+    and returns as a downloadable .json file named after the original PDF.
 
     Args:
-        job_id (str): Job ID
+        job_id (str): Job ID from /parse/pdf
 
     Returns:
-        PdfParseResult: Per-page content and tables
-
-    Raises:
-        HTTPException: 202 if still processing; 404 if file not found; 500 on error
+        Response: Downloadable JSON file with PdfParseResult content
     """
     try:
         result = await _get_call_result(job_id, timeout=0)
@@ -432,11 +457,7 @@ async def download_result(job_id: str):
     if status_val == JobStatusEnum.ERROR:
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "job_id": job_id,
-                "status": JobStatusEnum.ERROR,
-                "error": result.get("error"),
-            },
+            content={"job_id": job_id, "status": JobStatusEnum.ERROR, "error": result.get("error")},
         )
 
     output_filename = result.get("output_path")
@@ -445,7 +466,6 @@ async def download_result(job_id: str):
             status_code=status.HTTP_404_NOT_FOUND, detail="No output file recorded for this job."
         )
 
-    # Reload the volume so this container sees files committed by the worker.
     await results_volume.reload.aio()
 
     file_path = f"/results/{output_filename}"
@@ -463,7 +483,18 @@ async def download_result(job_id: str):
             if line:
                 elements.append(json.loads(line))
 
-    pdf_result = _build_pdf_result(job_id, elements)
+    pdf_result = _build_pdf_result(
+        job_id=job_id,
+        elements=elements,
+        filename=result.get("filename", ""),
+        duration_seconds=result.get("duration_seconds", 0.0),
+        user_metadata=result.get("user_metadata", {}),
+        total_pages=result.get("total_pages", 0),
+        start_page=result.get("start_page"),
+        end_page=result.get("end_page"),
+    )
+
+    # Strip timestamp suffix from JSONL filename to get original name
     original_name = Path(output_filename).stem.rsplit("_", 2)[0]
     return Response(
         content=pdf_result.model_dump_json(indent=2),
@@ -473,18 +504,6 @@ async def download_result(job_id: str):
 
 
 def _parse_metadata(metadata_str: str) -> dict:
-    """
-    Parse the metadata JSON string sent as a form field.
-
-    Args:
-        metadata_str (str): Raw JSON string from the form field
-
-    Returns:
-        dict: Parsed metadata dictionary
-
-    Raises:
-        HTTPException: If the value is not valid JSON or not a JSON object
-    """
     try:
         parsed = json.loads(metadata_str)
     except json.JSONDecodeError as e:
@@ -501,16 +520,6 @@ def _parse_metadata(metadata_str: str) -> dict:
 
 
 def _validate_ext(filename: str, allowed: set[str]) -> None:
-    """
-    Validate file extension
-
-    Args:
-        filename (str): Nama file
-        allowed (set[str]): Set of allowed extensions
-
-    Raises:
-        HTTPException: If the file extension is not allowed
-    """
     suffix = "." + (filename or "").rsplit(".", 1)[-1].lower()
     if suffix not in allowed:
         raise HTTPException(
@@ -520,16 +529,6 @@ def _validate_ext(filename: str, allowed: set[str]) -> None:
 
 
 def _validate_page_range(start: int | None, end: int | None) -> None:
-    """
-    Validate page range
-
-    Args:
-        start (int | None): Start page
-        end (int | None): End page
-
-    Raises:
-        HTTPException: If the page range is invalid
-    """
     if start and end and start > end:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -538,18 +537,6 @@ def _validate_page_range(start: int | None, end: int | None) -> None:
 
 
 def optional_int(value: str | None = None) -> int | None:
-    """
-    Parse form int — return None if null
-
-    Args:
-        value (str | None): Value to parse
-
-    Returns:
-        int | None: Parsed integer value
-
-    Raises:
-        HTTPException: If the value is invalid
-    """
     if value is None or str(value).strip() == "":
         return None
     try:
@@ -562,18 +549,7 @@ def optional_int(value: str | None = None) -> int | None:
 
 
 async def _read_file(file: UploadFile) -> bytes:
-    """
-    Read file bytes
 
-    Args:
-        file (UploadFile): File to read
-
-    Returns:
-        bytes: File bytes
-
-    Raises:
-        HTTPException: If the file cannot be read
-    """
     try:
         return await file.read()
     except Exception as e:

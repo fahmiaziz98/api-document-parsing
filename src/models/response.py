@@ -14,7 +14,7 @@ class JobStatusEnum(StrEnum):
 
 
 class ElementTypeEnum(StrEnum):
-    """Enumeration of possible element types in a parsed PDF."""
+    """Enumeration of possible element types in a parsed document — used internally by exporter."""
 
     TEXT = "text"
     HEADING = "heading"
@@ -61,6 +61,25 @@ class PageTableMarkdown(BaseModel):
     content: str = Field(..., description="Markdown representation of the table.")
 
 
+class ImageMetadata(BaseModel):
+    """Metadata for a parsed image file."""
+
+    filename: str = Field(..., description="Original uploaded filename.")
+    extension: str = Field(..., description="File extension, e.g. '.jpg'.")
+    duration_seconds: float = Field(..., description="Parsing duration in seconds.")
+
+
+class PdfMetadata(BaseModel):
+    """Metadata for a parsed PDF file."""
+
+    filename: str = Field(..., description="Original uploaded filename.")
+    extension: str = Field(..., description="File extension, e.g. '.pdf'.")
+    duration_seconds: float = Field(..., description="Parsing duration in seconds.")
+    page_range: dict[str, int] = Field(
+        ..., description="Parsed page range, e.g. {'start': 1, 'end': 10}."
+    )
+
+
 class ImageParseResult(BaseModel):
     """
     Response model for parsed image files.
@@ -74,6 +93,7 @@ class ImageParseResult(BaseModel):
         default=JobStatusEnum.DONE, description="Final status of the job."
     )
     page_count: int = Field(default=1, description="Always 1 for image inputs.")
+    metadata: ImageMetadata = Field(..., description="File and parsing metadata.")
     full_content: str | None = Field(None, description="All extracted text from the image.")
     table_markdown: str | None = Field(
         None, description="Markdown table if a table was detected, otherwise null."
@@ -93,6 +113,7 @@ class PdfParseResult(BaseModel):
         default=JobStatusEnum.DONE, description="Final status of the job."
     )
     page_count: int = Field(..., description="Total number of pages parsed.")
+    metadata: PdfMetadata = Field(..., description="File and parsing metadata.")
     full_content: list[PageContent] = Field(
         default_factory=list,
         description="Aggregated text content per page.",

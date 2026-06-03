@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -46,7 +47,6 @@ image = (
         "/root/model-cache": model_volume,
     },
     env={
-        # Model cache paths
         "HF_HOME": "/root/model-cache/huggingface",
         "DOCLING_CACHE_DIR": "/root/model-cache/docling-models",
         "TORCH_HOME": "/root/model-cache/torch",
@@ -54,13 +54,11 @@ image = (
         "RECOGNITION_BATCH_SIZE": "512",
         "ORDER_BATCH_SIZE": "32",
     },
-    scaledown_window=15 * 60,  # 15 minutes
+    scaledown_window=15 * 60,
 )
 @modal.concurrent(max_inputs=5, target_inputs=2)
 class DocumentParser:
-    """
-    Single class for PDF and image parsing.
-    """
+    """Single class for PDF and image parsing."""
 
     @modal.enter()
     def load(self):
@@ -86,21 +84,14 @@ class DocumentParser:
 
         logger.info("DocumentParser models loaded and ready")
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _finish_parse(self, doc, metadata: dict, filename: str) -> dict:
         """
         Shared post-conversion step: export elements, persist to JSONL, return result dict.
 
-        Extracted to eliminate the identical tail block that was duplicated in both
-        ``parse_pdf`` and ``parse_image``.
-
         Args:
             doc: Docling document object produced by a converter.
             metadata: Arbitrary user-supplied metadata dict.
-            filename: Original uploaded filename (used for export and output naming).
+            filename: Original uploaded filename.
 
         Returns:
             dict: Result payload with status, element_count, output_path, and elements.
@@ -132,22 +123,24 @@ class DocumentParser:
         enable_crop: bool = False,
     ) -> dict:
         """
-        Parse a PDF file containing a corporate annual report.
+        Parse a PDF file.
 
         Args:
             file_bytes: Bytes of the PDF file
-            filename: Filename
-            metadata: Arbitrary user-supplied metadata (e.g. company, year, label, type…)
-            start_page: Start page
-            end_page: End page
+            filename: Original uploaded filename
+            metadata: Arbitrary user-supplied metadata (e.g. company, year…)
+            start_page: Start page (1-indexed, None = from beginning)
+            end_page: End page (1-indexed, None = to end)
             enable_rotate: Enable auto-rotation
             enable_crop: Enable content cropping
 
         Returns:
-            dict: Job status and results
+            dict: Job status, elements, and metadata for building PdfParseResult
         """
         from src.core.preprocess import preprocess_pdf
         from src.models.response import JobStatusEnum
+
+        t_start = time.monotonic()
 
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -166,16 +159,18 @@ class DocumentParser:
                         dpi=72,
                     )
 
-                if start_page or end_page:
-                    pdf_doc = fitz.open(str(input_path))
-                    total_pages = len(pdf_doc)
-                    pdf_doc.close()
+                pdf_doc = fitz.open(str(input_path))
+                total_pages = len(pdf_doc)
+                pdf_doc.close()
 
+                if start_page or end_page:
                     resolved_start = max(1, start_page or 1)
                     resolved_end = min(total_pages, end_page or total_pages)
                     page_range = (resolved_start, resolved_end)
                     logger.info(f"Page range: {page_range} / {total_pages}")
                 else:
+                    resolved_start = 1
+                    resolved_end = total_pages
                     page_range = None
                     logger.info("Page range: full document")
 
@@ -184,7 +179,18 @@ class DocumentParser:
                     convert_kwargs["page_range"] = page_range
 
                 result = self.pdf_converter.convert(**convert_kwargs)
-                return self._finish_parse(result.document, metadata, filename)
+                parsed = self._finish_parse(result.document, metadata, filename)
+
+                duration = time.monotonic() - t_start
+                return {
+                    **parsed,
+                    "filename": filename,
+                    "duration_seconds": round(duration, 2),
+                    "user_metadata": metadata,
+                    "total_pages": total_pages,
+                    "start_page": resolved_start,
+                    "end_page": resolved_end,
+                }
 
         except Exception as e:
             logger.error("parse_pdf failed", exc_info=True)
@@ -200,17 +206,17 @@ class DocumentParser:
         enable_crop: bool = False,
     ) -> dict:
         """
-        Parse an image file containing a corporate annual report.
+        Parse an image file.
 
         Args:
             file_bytes: Bytes of the image file
-            filename: Filename
-            metadata: Arbitrary user-supplied metadata (e.g. company, year, label, type…)
+            filename: Original uploaded filename
+            metadata: Arbitrary user-supplied metadata (e.g. company, year…)
             enable_rotate: Enable auto-rotation
             enable_crop: Enable content cropping
 
         Returns:
-            dict: Job status and results
+            dict: Job status and elements
         """
         from src.core.preprocess import preprocess_image
         from src.models.response import JobStatusEnum
@@ -245,11 +251,10 @@ class DocumentParser:
 
 def _save_jsonl(elements: list[dict], filename: str) -> str:
     """
-    Save elements to a JSONL file.
+    Save elements to a JSONL file on Modal Volume.
 
-    The output filename is derived from the original file stem combined with
-    the current timestamp: ``{stem}_{YYYYMMDD_HHMMSS}.jsonl``.
-    For example, ``data.pdf`` → ``data_20260318_082054.jsonl``.
+    Output filename: ``{stem}_{YYYYMMDD_HHMMSS}.jsonl``
+    Example: ``report.pdf`` → ``report_20260318_082054.jsonl``
 
     Args:
         elements: List of elements to save
